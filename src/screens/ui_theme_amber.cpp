@@ -37,6 +37,8 @@
 #include "amber.h"
 #include "ui_sleep_button.h"   // the sleep timer, shared with the other players
 #include "clock_screen.h"      // clock_12h, for the shelf clock (#199)
+#include "favorites.h"         // the Favorites row under the transport
+#include "config.h"
 #include <time.h>
 #include <ctype.h>
 
@@ -67,20 +69,41 @@
 // space above the artist and 7px below it. Moving up 12 spends some of the
 // former on the latter: clearance goes 7px -> 19px on the 4", 9px -> 24px on
 // the 7", and the pill still keeps an 18px gap.
-#define AP_ARTIST_Y   80
-#define AP_TITLE_Y    114
+// The right column was re-spaced to make room for the Favorites row under the
+// transport. Everything above the transport moved up by 6-48px; every title, album
+// and progress widget derives from these, so nothing else needs touching.
+//
+//   artist 72 | title 100..178 | album 180 | progress 206 | times 218
+//   transport 240..318 | favorites 328..358 and 364..394 | volume 414 | bottom 432..480
+#define AP_ARTIST_Y   72
+#define AP_TITLE_Y    100
 #define AP_TITLE_H    78
-#define AP_ALBUM_Y    198
-#define AP_PROG_Y     230
-#define AP_TIME_Y     244
-#define AP_CTRL_Y     288
+#define AP_ALBUM_Y    180
+#define AP_PROG_Y     206
+#define AP_TIME_Y     218
+#define AP_CTRL_Y     240
 #define AP_CTRL_H     78
-#define AP_VOL_Y      404
+#define AP_FAV_Y      328                  // first favorites row
+#define AP_FAV_H      30
+#define AP_FAV_GAP    6
+#define AP_VOL_Y      414
+
+#define AP_FAV_COL_GAP 9
+#define AP_LYR_BTN_W  116                  // Lyrics on/off button in the shelf
 
 static lv_obj_t* ap_shelf_next = nullptr;   // the "NEXT" block
+static lv_obj_t* ap_next_rule  = nullptr;   // the hairline after the NEXT caption
 static lv_obj_t* ap_lyric_slot = nullptr;   // the lyrics overlay's wrapper
 static lv_obj_t* ap_lyric_cur  = nullptr;   // the current line, auto-fitted
 static lv_timer_t* ap_shelf_timer = nullptr;
+
+// ── Favorites row and the small clock ───────────────────────────────────────
+static lv_obj_t* ap_fav_btn[FAV_SHOWN];
+static lv_obj_t* ap_fav_lbl[FAV_SHOWN];
+static uint32_t  ap_fav_version = 0xFFFFFFFFu;   // favoritesVersion() last painted
+static lv_obj_t* ap_small_clock = nullptr;        // "21:05", chip on the art's top-left
+static void favRowSync(void);
+static void smallClockTick(void);
 
 // ── Shelf clock (#199) ──────────────────────────────────────────────────────
 // A third, mutually exclusive occupant of the shelf. Built unconditionally and
@@ -96,6 +119,15 @@ static lv_obj_t* ap_clk_wx_icon = nullptr;
 static lv_obj_t* ap_clk_wx_temp = nullptr;
 static void shelfClockTick(void);
 
+// Repaint caches for the ticks below. File scope so ap_screen_deleted() can reset
+// them: a rebuilt player (themeSet) must repaint at once, not at the next change.
+static int    ap_shelf_last_min  = -1;
+static int    ap_shelf_last_day  = -1;
+static int    ap_small_last_min  = -2;
+static bool   ap_small_last_12h  = false;
+static uint32_t ap_small_stopped_ms = 0;   // millis() when ui_playing went false, 0 = playing
+static String ap_lyric_last;
+
 
 // Defined below, next to the reasoning for it; used by shelfSwapCb() above it.
 static void spFitLyric(lv_obj_t* lbl, const char* text);
@@ -110,6 +142,13 @@ static void spFitLyric(lv_obj_t* lbl, const char* text);
 // 200ms is far below the rate either side actually changes.
 static void shelfSwapCb(lv_timer_t*) {
     if (!ap_shelf_next || !ap_lyric_slot) return;
+
+    favRowSync();
+    smallClockTick();
+    // The lyrics toggle shares the shelf's top-right corner with the big clock's
+    // weather column, so it steps aside while that clock is showing. It is still
+    // reachable in Settings, where the two are mutually exclusive anyway.
+    if (btn_lyrics) lv_obj_set_hidden(btn_lyrics, amber_shelf_clock);
 
     // The clock takes the WHOLE shelf when it is on - it replaces Next-up and
     // the lyrics both, which is the point of it (#199). Checked before either,
@@ -129,14 +168,24 @@ static void shelfSwapCb(lv_timer_t*) {
     if (lyrics_showing) lv_obj_set_hidden(ap_shelf_next, true);
     else                lv_obj_set_hidden(ap_shelf_next, false);
 
+    // The lyrics status ("Fetching lyrics...") uses the NEXT caption's row, so the
+    // caption and its rule fade out while it shows. Opacity, not the hidden flag:
+    // updateUI() and radio mode own lbl_next_header's hidden flag.
+    if (lbl_lyrics_status && lbl_next_header) {
+        const lv_opa_t opa = lv_label_get_text(lbl_lyrics_status)[0] != '\0' ? LV_OPA_TRANSP : LV_OPA_COVER;
+        if (lv_obj_get_style_opa(lbl_next_header, LV_PART_MAIN) != opa) {   // no redraw per tick
+            lv_obj_set_style_opa(lbl_next_header, opa, 0);
+            if (ap_next_rule) lv_obj_set_style_opa(ap_next_rule, opa, 0);
+        }
+    }
+
     // Refit when the line changes. Compared by content rather than by index so a
     // repeated line (choruses repeat) does not re-measure, and a track change
     // that lands on the same index does.
     if (!lyrics_showing || !ap_lyric_cur) return;
-    static String last;
     const char* cur = lyricsCurrentText();
-    if (cur && last != cur) {
-        last = cur;
+    if (cur && ap_lyric_last != cur) {
+        ap_lyric_last = cur;
         spFitLyric(ap_lyric_cur, cur);
     }
 }
@@ -149,8 +198,8 @@ static void shelfSwapCb(lv_timer_t*) {
 static void shelfClockTick(void) {
     if (!ap_clk_time) return;
 
-    static int last_min = -1;
-    static int last_day = -1;
+    int& last_min = ap_shelf_last_min;
+    int& last_day = ap_shelf_last_day;
 
     struct tm t;
     if (!getLocalTime(&t, 0)) {
@@ -228,6 +277,78 @@ static void shelfClockTick(void) {
     }
 }
 
+// ── Favorites row ───────────────────────────────────────────────────────────
+// Repainted only when the loader publishes a new list (favoritesVersion), so the
+// 200ms tick costs one integer compare.
+static void favRowSync(void) {
+    const uint32_t v = favoritesVersion();
+    if (v == ap_fav_version) return;
+    ap_fav_version = v;
+    const int n = favoritesCount();
+    for (int i = 0; i < FAV_SHOWN; i++) {
+        if (!ap_fav_btn[i]) continue;
+        if (i < n) {
+            // Copied under the loader's lock: a later fetch may be rewriting it.
+            char title[48];
+            if (!favoritesTitleCopy(i, title, sizeof(title))) {
+                ap_fav_version = 0xFFFFFFFFu;    // busy: retry on the next tick
+                return;
+            }
+            lv_label_set_text(ap_fav_lbl[i], title);
+            lv_obj_set_hidden(ap_fav_btn[i], false);
+        } else {
+            lv_obj_set_hidden(ap_fav_btn[i], true);
+        }
+    }
+}
+
+// ── Small clock (artwork top-left) ──────────────────────────────────────────
+// Time only, so it costs one label and a repaint once a minute. getLocalTime() has
+// a ZERO timeout for the reason given at shelfClockTick(): this is the LVGL task.
+//
+// Shown while music plays. Once playback has been stopped or paused for 2s it
+// hides: the screensaver clock covers that state per the clock settings. The 2s
+// grace is the same debounce checkClockTrigger() uses, and for the same reason:
+// Sonos reports isPlaying=false for ~300-500ms between HLS tracks, which would
+// otherwise blink the chip on every track change.
+#define AP_SMALL_CLOCK_GRACE_MS 2000
+static void smallClockTick(void) {
+    if (!ap_small_clock) return;
+
+    bool show = !amber_shelf_clock;   // the big shelf clock already shows the time
+    if (ui_playing) {
+        ap_small_stopped_ms = 0;
+    } else if (lv_obj_is_hidden(ap_small_clock)) {
+        // The grace only delays HIDING. A chip that is already down stays down,
+        // so a fresh build (themeSet, boot) with nothing playing never flashes it.
+        show = false;
+    } else {
+        if (ap_small_stopped_ms == 0) ap_small_stopped_ms = millis() | 1u;   // 0 means "playing"
+        if (millis() - ap_small_stopped_ms >= AP_SMALL_CLOCK_GRACE_MS) show = false;
+    }
+    if (lv_obj_is_hidden(ap_small_clock) == show) lv_obj_set_hidden(ap_small_clock, !show);
+    if (!show) {
+        // Not painted while hidden, so force a repaint on reappearance: the cache
+        // alone would keep a stale hour when it comes back on the same minute.
+        ap_small_last_min = -2;
+        return;
+    }
+
+    int&  last_min = ap_small_last_min;
+    bool& last_12h = ap_small_last_12h;
+    struct tm t;
+    if (!getLocalTime(&t, 0)) {
+        if (last_min != -1) { lv_label_set_text(ap_small_clock, "--:--"); last_min = -1; }
+        return;
+    }
+    if (t.tm_min == last_min && clock_12h == last_12h) return;
+    last_min = t.tm_min;
+    last_12h = clock_12h;
+    char buf[16];
+    strftime(buf, sizeof(buf), clock_12h ? "%I:%M %p" : "%H:%M", &t);
+    lv_label_set_text(ap_small_clock, (clock_12h && buf[0] == '0') ? buf + 1 : buf);
+}
+
 // ── Fitting the lyric to its box ────────────────────────────────────────────
 // A lyric line is whatever the songwriter wrote — "Now I see your thinned face at
 // the window" is 44 characters, and plenty run to 60. At 20px in a 304px column
@@ -267,9 +388,22 @@ static void spFitLyric(lv_obj_t* lbl, const char* text) {
 // so it has to be torn down with it or it fires on freed widgets.
 static void ap_screen_deleted(lv_event_t*) {
     if (ap_shelf_timer) { lv_timer_delete(ap_shelf_timer); ap_shelf_timer = nullptr; }
+    for (int i = 0; i < FAV_SHOWN; i++) { ap_fav_btn[i] = nullptr; ap_fav_lbl[i] = nullptr; }
+    ap_fav_version = 0xFFFFFFFFu;
+    ap_small_clock = nullptr;
     ap_shelf_next = nullptr;
+    ap_next_rule  = nullptr;
     ap_lyric_slot = nullptr;
     ap_lyric_cur  = nullptr;
+    ap_shelf_clock = nullptr;
+    ap_clk_time = ap_clk_ampm = ap_clk_date = ap_clk_sec = nullptr;
+    ap_clk_wx = ap_clk_wx_icon = ap_clk_wx_temp = nullptr;
+    ap_shelf_last_min = -1;
+    ap_shelf_last_day = -1;
+    ap_small_last_min = -2;
+    ap_small_last_12h = false;
+    ap_small_stopped_ms = 0;
+    ap_lyric_last = "";
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -444,11 +578,13 @@ void buildAmberPlayer() {
 
     const int shelf_w = AP_ART - AP_SHELF_PAD * 2;   // 304
 
+    // The top strip of the shelf carries the Lyrics on/off button on the right, so
+    // the caption rides higher and its rule stops short of the button.
     lbl_next_header = ambCaption(ap_shelf_next, AMB_TEXT3, "NEXT", 3);
-    lv_obj_set_pos(lbl_next_header, SX(AP_SHELF_PAD), SY(22));
+    lv_obj_set_pos(lbl_next_header, SX(AP_SHELF_PAD), SY(14));
 
-    lv_obj_t* next_rule = ambRect(ap_shelf_next, shelf_w - 60, 1, AMB_LINE);
-    lv_obj_set_pos(next_rule, SX(AP_SHELF_PAD + 52), SY(28));
+    ap_next_rule = ambRect(ap_shelf_next, shelf_w - 52 - 124, 1, AMB_LINE);
+    lv_obj_set_pos(ap_next_rule, SX(AP_SHELF_PAD + 52), SY(20));
 
     // Height bounded and scrolling, for the same two reasons as the track
     // labels above: DOT with an unbounded height wraps instead of truncating,
@@ -493,12 +629,12 @@ void buildAmberPlayer() {
         lv_obj_set_style_bg_grad_opa(lyr, LV_OPA_TRANSP, 0);
         lv_obj_set_style_radius(lyr, 0, 0);
         lv_obj_set_style_pad_all(lyr, 0, 0);
-        lv_obj_set_size(lyr, SX(AP_ART), SY(AP_SHELF_H - 14));
+        lv_obj_set_size(lyr, SX(AP_ART), SY(AP_SHELF_H - 44));
         // Pin it to the top of the slot. createLyricsOverlay() bottom-aligns with
         // a -30 offset, which for a 122-tall block in a 136-tall slot put its top
         // edge 16px ABOVE the slot — so the first row was clipped by the shelf's
         // own boundary before anything else got a say.
-        lv_obj_align(lyr, LV_ALIGN_TOP_LEFT, 0, SY(8));
+        lv_obj_align(lyr, LV_ALIGN_TOP_LEFT, 0, SY(38));   // below the Lyrics on/off strip
         lv_obj_set_style_pad_left(lyr, SX(AP_SHELF_PAD), 0);
         lv_obj_set_style_pad_right(lyr, SX(AP_SHELF_PAD), 0);
         lv_obj_set_style_pad_row(lyr, SY(4), 0);
@@ -528,13 +664,12 @@ void buildAmberPlayer() {
         // The current line is PURE WHITE rather than AMB_TEXT (#F5F1EA). Against
         // #0E0D0C at 20px this is the one string on the panel worth the extra
         // contrast, and the neighbours sit a tier down so the eye lands on it.
-        // THREE rows for the current line, not two, and the font is fitted to them
-        // per line by spFitLyric(). LONG_DOT stays as a backstop only — at the
-        // bottom of the ladder the box holds far more than any sung line, so it
-        // should never actually trim.
+        // The current line gets a 56px box (rows[] below): two rows of font_text_20,
+        // and more rows when spFitLyric() steps the font down for a long line.
+        // The next line gets one 18px row. LONG_DOT stays as a backstop only.
         const lv_font_t* fonts[3] = { &font_text_12, &font_text_20, &font_text_12 };
         const lv_color_t cols[3]  = { AMB_TEXT3, AMB_TEXT_HI, AMB_TEXT2 };
-        const int        rows[3]  = { 0,             78,            20 };
+        const int        rows[3]  = { 0,             56,            18 };
         for (int i = 0; i < 3; i++) {
             lv_obj_t* l = lv_obj_get_child(lyr, i);
             if (!l) continue;
@@ -656,11 +791,65 @@ void buildAmberPlayer() {
         lv_obj_align(ap_clk_sec, LV_ALIGN_BOTTOM_LEFT, 0, -SY(16));
     }
 
+    // ── Lyrics on/off ───────────────────────────────────────────────────────
+    // Moved here from the header, where it was an "LRC" indicator. It is a real
+    // toggle now: gold when lyrics are on, muted when off, with the same setting
+    // (and NVS key) as Settings > General > Show synced lyrics. Created after the
+    // shelf occupants so it sits above them and keeps its taps.
+    {
+        lv_obj_t* lb = lv_button_create(panel_art);
+        lv_obj_set_size(lb, SX(AP_LYR_BTN_W), SY(28));
+        lv_obj_set_pos(lb, SX(AP_ART - AP_SHELF_PAD - AP_LYR_BTN_W), SY(AP_SHELF_Y + 8));
+        lv_obj_set_style_radius(lb, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_color(lb, AMB_CARD, 0);
+        pressFade(lb);
+        lv_obj_set_style_border_color(lb, AMB_BORDER, 0);
+        lv_obj_set_style_border_width(lb, 1, 0);
+        lv_obj_set_style_shadow_width(lb, 0, 0);
+        lv_obj_set_style_pad_all(lb, 0, 0);
+        lv_obj_set_ext_click_area(lb, SMIN(6));
+        lv_obj_add_event_cb(lb, ev_lyrics_toggle, LV_EVENT_CLICKED, NULL);
+        lv_obj_t* ll = lv_label_create(lb);            // child 0: updateLyricsStatus() colours it
+        lv_label_set_text(ll, "Lyrics on/off");
+        lv_obj_set_style_text_font(ll, &font_text_12, 0);
+        lv_obj_set_style_text_color(ll, AMB_TEXT3, 0);
+        lv_obj_center(ll);
+        btn_lyrics = lb;
+    }
+
     lbl_lyrics_status = lv_label_create(panel_art);
     lv_label_set_text(lbl_lyrics_status, "");
-    lv_obj_set_pos(lbl_lyrics_status, SX(AP_SHELF_PAD), SY(AP_SHELF_Y + 4));
+    // On the NEXT caption's row (shelfSwapCb fades the caption while this shows),
+    // bounded so a long message stops short of the Lyrics on/off button.
+    lv_obj_set_pos(lbl_lyrics_status, SX(AP_SHELF_PAD), SY(AP_SHELF_Y + 14));
+    lv_obj_set_size(lbl_lyrics_status, SX(AP_ART - AP_SHELF_PAD * 2 - AP_LYR_BTN_W - 8),
+                    lv_font_get_line_height(&font_text_12));
+    lv_label_set_long_mode(lbl_lyrics_status, LV_LABEL_LONG_DOT);
     lv_obj_set_style_text_color(lbl_lyrics_status, AMB_TEXT3, 0);
     lv_obj_set_style_text_font(lbl_lyrics_status, &font_text_12, 0);
+
+    // ── Small clock: a chip on the artwork's top-left corner ────────────────
+    // The player no longer gives way to the screensaver while music plays, so
+    // this is where the time lives during playback. smallClockTick() owns its
+    // text and visibility. Created last in panel_art so it draws over the art,
+    // the placeholder and the line-in/TV heroes (none of which reach this
+    // corner anyway). A file static rather than a mode-handler global, so radio,
+    // line-in and TV mode, which hide named widgets only, leave it alone.
+    //
+    // A label styled as a pill rather than a container + label: one object, and
+    // LV_SIZE_CONTENT lets it follow "9:05 PM" vs "12:45 PM". Translucent AMB_BG
+    // keeps it legible on bright artwork and on the flat placeholder ground.
+    // NOT clickable, so a tap on it falls through to img_album (ev_album_tap):
+    // lv_obj_hit_test() rejects non-clickable objects, and the search moves on.
+    ap_small_clock = ambLabel(panel_art, &font_text_16, AMB_TEXT, "--:--");
+    lv_obj_set_clickable(ap_small_clock, false);
+    lv_obj_set_style_bg_color(ap_small_clock, AMB_BG, 0);
+    lv_obj_set_style_bg_opa(ap_small_clock, LV_OPA_60, 0);
+    lv_obj_set_style_radius(ap_small_clock, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_pad_hor(ap_small_clock, SX(10), 0);
+    lv_obj_set_style_pad_ver(ap_small_clock, SY(4), 0);
+    lv_obj_set_pos(ap_small_clock, SX(10), SY(10));
+    lv_obj_set_hidden(ap_small_clock, true);   // until something is playing
 
     ap_shelf_timer = lv_timer_create(shelfSwapCb, 200, nullptr);
 
@@ -703,26 +892,14 @@ void buildAmberPlayer() {
     lv_obj_set_style_text_font(chev, &font_icon_16, 0);
     lv_obj_set_style_text_color(chev, AMB_TEXT3, 0);
 
-    // LRC / queue / settings, right-aligned in that order.
+    // Groups / queue / settings, right-aligned in that order. The Groups button
+    // used to be reachable only from Settings; it is a first-class control now,
+    // and the LRC indicator it replaces became the Lyrics on/off button under the
+    // artwork.
     const int chip = AP_HEAD_H, gap = 10;
-    // An INDICATOR, not a control. It briefly toggled lyrics, but that setting
-    // already lives in Settings > General and two places to change one thing is
-    // an invitation for them to disagree. What it is actually good for is saying
-    // whether THIS track has synced lyrics — which is a thing you cannot
-    // otherwise tell until the shelf either fills or does not.
-    //
-    // No callback, so it gives no press feedback for something it will not do.
-    // updateLyricsStatus() lights it; see btn_lyrics in ui_common.h.
-    lv_obj_t* lrc = roundBtn(panel_right, "", &font_text_12, AP_RIGHT - chip * 3 - gap * 2,
-                             AP_HEAD_Y, chip, NULL, true, AMB_TEXT3);
-    lv_obj_set_clickable(lrc, false);
-    btn_lyrics = lrc;
-    // A text chip, not a glyph: the MDI set carries no "lyrics" icon and the
-    // canvas labels this one "LRC" anyway.
-    if (lv_obj_t* l = lv_obj_get_child(lrc, 0)) {
-        lv_label_set_text(l, "LRC");
-        lv_obj_set_style_text_letter_space(l, 1, 0);
-    }
+    lv_obj_t* grp = roundBtn(panel_right, AMB_IC_GROUPS, &font_icon_24,
+                             AP_RIGHT - chip * 3 - gap * 2, AP_HEAD_Y, chip, ev_groups, true, AMB_TEXT2);
+    lv_obj_set_ext_click_area(grp, 8);
 
     btn_queue = roundBtn(panel_right, AMB_IC_QUEUE, &font_icon_24,
                          AP_RIGHT - chip * 2 - gap, AP_HEAD_Y, chip, ev_queue, true, AMB_TEXT2);
@@ -838,6 +1015,47 @@ void buildAmberPlayer() {
     lv_obj_set_style_text_color(ico_play, AMB_ON_ACCENT, 0);
     lv_obj_center(ico_play);
 
+    // ── Favorites: the first six, in two rows of three, under the transport ──
+    // Data comes from favorites.cpp, which loads it in the background; a chip is
+    // hidden until its slot has a favorite. A tap starts it off the UI thread.
+    {
+        const int cw = (AP_RW - 2 * AP_FAV_COL_GAP) / 3;   // 130
+        for (int i = 0; i < FAV_SHOWN; i++) {
+            lv_obj_t* b = lv_button_create(panel_right);
+            lv_obj_set_size(b, SX(cw), SY(AP_FAV_H));
+            const int fx = AP_R + (i % 3) * (cw + AP_FAV_COL_GAP);
+            const int fy = AP_FAV_Y + (i / 3) * (AP_FAV_H + AP_FAV_GAP);
+            lv_obj_set_pos(b, SX(fx), SY(fy));
+            lv_obj_set_style_radius(b, LV_RADIUS_CIRCLE, 0);
+            lv_obj_set_style_bg_color(b, AMB_CARD, 0);
+            pressFade(b);
+            lv_obj_set_style_border_color(b, AMB_BORDER, 0);
+            lv_obj_set_style_border_width(b, 1, 0);
+            lv_obj_set_style_shadow_width(b, 0, 0);
+            lv_obj_set_style_pad_hor(b, SX(12), 0);
+            lv_obj_set_style_pad_ver(b, 0, 0);
+            lv_obj_set_user_data(b, (void*)(intptr_t)i);
+            lv_obj_add_event_cb(b, [](lv_event_t* e) {
+                favoritesPlay((int)(intptr_t)lv_obj_get_user_data((lv_obj_t*)lv_event_get_target(e)));
+            }, LV_EVENT_CLICKED, NULL);
+            lv_obj_set_hidden(b, true);
+
+            lv_obj_t* l = lv_label_create(b);
+            lv_obj_set_width(l, SX(cw - 24));
+            lv_obj_set_height(l, lv_font_get_line_height(&font_text_12));
+            lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
+            lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
+            lv_obj_set_style_text_font(l, &font_text_12, 0);
+            lv_obj_set_style_text_color(l, AMB_TEXT2, 0);
+            lv_label_set_text(l, "");
+            lv_obj_center(l);
+
+            ap_fav_btn[i] = b;
+            ap_fav_lbl[i] = l;
+        }
+        favoritesRequestRefresh();
+    }
+
     // ── Volume ──────────────────────────────────────────────────────────────
     btn_mute = roundBtn(panel_right, AMB_IC_VOL, &font_icon_24,
                         AP_R - 4, AP_VOL_Y - 10, 28, ev_mute, false, AMB_TEXT3);
@@ -886,6 +1104,9 @@ void buildAmberPlayer() {
 
         lv_obj_t* bat = batteryBadgeCreate(row, BATTERY_BADGE_CURRENT);
         lv_obj_align(bat, LV_ALIGN_LEFT_MID, 0, 0);
+
+        // The small clock sat centred here until it moved to the artwork's
+        // top-left corner (see the chip in the left column above).
 
         // Shared with Classic and Immersive (ui_sleep_button.cpp): one
         // implementation of the countdown, its colours and its tap target.

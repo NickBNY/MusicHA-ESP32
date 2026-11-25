@@ -25,6 +25,39 @@
 // Command debounce tracking
 static uint32_t lastCommandTime = 0;
 
+// Serialises playURI/playContainer/playPlaylist. FavPlay/SrcPlay (favorites.cpp)
+// and BrowsePlay (ui_settings_screens.cpp) each have their own single-flight
+// flag, so two of them can run at once and interleave two queue rebuilds
+// (clear, add, set transport) on the same speaker. Created in begin().
+static SemaphoreHandle_t s_play_lock = NULL;
+// Serialises startTasks(): the deferred discovery task (main.cpp), the speaker
+// pickers on mainAppTask (ui_devices_screen.cpp, ui_amber_overlays.cpp) and
+// resumeTasks() after a failed OTA can all reach it, and two callers could see
+// the same NULL handle and create a second task on the same static TCB.
+// Created in begin().
+static SemaphoreHandle_t s_task_lock = NULL;
+
+// Holds s_play_lock for the life of a play call. 45 s covers one full rebuild
+// (pre-switch retries, clear, add retries, SONOS_ENQUEUE_SETTLE_MS wait, set
+// retries). If begin() has not run the lock is null and the call proceeds
+// unlocked, as before.
+struct PlayLockGuard {
+    bool ok = true;
+    bool held = false;
+    explicit PlayLockGuard(const char* tag) {
+        if (!s_play_lock) return;
+        if (xSemaphoreTake(s_play_lock, pdMS_TO_TICKS(45000)) == pdTRUE) {
+            held = true;
+        } else {
+            Serial.printf("[%s] Another play request is still running - giving up\n", tag);
+            ok = false;
+        }
+    }
+    ~PlayLockGuard() { if (held) xSemaphoreGive(s_play_lock); }
+    PlayLockGuard(const PlayLockGuard&) = delete;
+    PlayLockGuard& operator=(const PlayLockGuard&) = delete;
+};
+
 // Encode string for XML/SOAP transport
 static void encodeXML(String& s) {
     s.replace("&", "&amp;");
@@ -90,6 +123,8 @@ void SonosController::begin() {
     }
 
     deviceMutex = xSemaphoreCreateMutex();
+    if (!s_play_lock) s_play_lock = xSemaphoreCreateMutex();
+    if (!s_task_lock) s_task_lock = xSemaphoreCreateMutex();
     commandQueue = xQueueCreate(SONOS_CMD_QUEUE_SIZE, sizeof(CommandRequest_t));
     uiUpdateQueue = xQueueCreate(SONOS_UI_QUEUE_SIZE, sizeof(UIUpdate_t));
     prefs.begin("sonos", false);
@@ -97,6 +132,7 @@ void SonosController::begin() {
 }
 
 void SonosController::startTasks() {
+    if (s_task_lock) xSemaphoreTake(s_task_lock, portMAX_DELAY);
     if (networkTaskHandle == NULL) {
         if (!networkTaskStack)
             networkTaskStack = (StackType_t*)heap_caps_malloc(SONOS_NET_TASK_STACK, MALLOC_CAP_SPIRAM);
@@ -123,6 +159,7 @@ void SonosController::startTasks() {
                                     this, SONOS_POLL_TASK_PRIORITY, &pollingTaskHandle, 1);
         }
     }
+    if (s_task_lock) xSemaphoreGive(s_task_lock);
     Serial.println("[SONOS] Background tasks started");
 }
 
@@ -844,8 +881,10 @@ bool SonosController::saveCurrentTrack(const char* playlistName) {
 }
 
 String SonosController::browseContent(const char* objectID, int startIndex, int count) {
-    // Use static buffer to avoid String concatenation
-    static char args[512];
+    // Stack buffer, not static: the Favorites loader now browses from its own task
+    // while the UI thread may be browsing too, and a shared static was one buffer
+    // for both. 512 bytes is well inside every caller's stack.
+    char args[512];
     snprintf(args, sizeof(args),
         "<ObjectID>%s</ObjectID>"
         "<BrowseFlag>BrowseDirectChildren</BrowseFlag>"
@@ -871,6 +910,8 @@ String SonosController::browseContent(const char* objectID, int startIndex, int 
 }
 
 bool SonosController::playURI(const char* uri, const char* metadata) {
+    PlayLockGuard play_lock("PLAY");
+    if (!play_lock.ok) return false;
     SonosDevice* dev = getCurrentDevice();
     if (!dev || !dev->connected) {
         Serial.println("[PLAY] Device not available");
@@ -938,12 +979,13 @@ static bool enqueueShouldRetry(int http_code, const String& resp) {
 int SonosController::waitForQueueToFill(uint32_t timeout_ms) {
     const uint32_t start = millis();
     while (millis() - start < timeout_ms) {
-        // This runs on the UI task from the Browse tap handler, and that task is
-        // subscribed to the 30s task watchdog. Nothing else feeds it while we sit
-        // here: the whole sequence - the switch-to-queue retries, the clear, the
-        // add that timed out, then these checks - can outlast the watchdog on a
-        // struggling speaker and reboot the panel. Feed it on every pass.
-        esp_task_wdt_reset();
+        // The callers are now the one-shot play tasks (FavPlay, SrcPlay,
+        // BrowsePlay), which are not subscribed to the task watchdog, and
+        // esp_task_wdt_reset() from an unsubscribed task only logs an error.
+        // Feed only when the caller is subscribed, so a future call from a
+        // watched task (the whole retry sequence can outlast 30 s on a
+        // struggling speaker) still keeps the panel from rebooting.
+        if (esp_task_wdt_status(NULL) == ESP_OK) esp_task_wdt_reset();
         vTaskDelay(pdMS_TO_TICKS(SONOS_ENQUEUE_SETTLE_POLL_MS));
 
         // Browse Q:0, NOT GetMediaInfo. Both callers carry on even when the
@@ -991,11 +1033,14 @@ int SonosController::queueTrackCount() {
 }
 
 bool SonosController::playPlaylist(const char* playlistID, const char* title) {
+    PlayLockGuard play_lock("PLAYLIST");
+    if (!play_lock.ok) return false;
     SonosDevice* dev = getCurrentDevice();
     if (!dev || !dev->connected) {
         Serial.println("[PLAYLIST] Device not available");
         return false;
     }
+    String rincon;   // filled under deviceMutex below
 
     Serial.printf("[PLAYLIST] Loading playlist: %s (%s)\n", playlistID, title);
 
@@ -1014,19 +1059,31 @@ bool SonosController::playPlaylist(const char* playlistID, const char* title) {
         // an unlocked indexOf() here can read freed memory — a fault, not just a
         // stale value. On timeout the snapshot stays empty, which falls through to
         // the pre-switch: the same thing the old code did when the URI was unknown.
+        // rinconID is copied in the same window for the same reason; both queue
+        // URIs below are built from that local, never from dev->rinconID.
         String uriNow;
         if (xSemaphoreTake(deviceMutex, pdMS_TO_TICKS(50))) {
             uriNow = dev->currentURI;
+            rincon = dev->rinconID;
             xSemaphoreGive(deviceMutex);
+        }
+        if (rincon.length() == 0) {
+            // Lock timed out (or no ID yet): "x-rincon-queue:#0" would only fail
+            // later, after the queue was already emptied.
+            Serial.println("[PLAYLIST] Device ID unavailable - not loading");
+            return false;
         }
         bool alreadyQueue = uriNow.indexOf("rincon-queue") >= 0 ||
                             uriNow.indexOf("x-rincon-queue") >= 0;
         if (alreadyQueue) {
             Serial.println("[PLAYLIST] Already in queue transport mode — skipping pre-switch");
         } else {
-            static char switchArgs[256];
-            static char switchURI[128];
-            snprintf(switchURI, sizeof(switchURI), "x-rincon-queue:%s#0", dev->rinconID.c_str());
+            // Stack locals, not function statics: the play tasks (FavPlay, SrcPlay,
+            // BrowsePlay) can each be inside this function, and a shared static
+            // buffer would hand one caller the other's URI.
+            char switchArgs[256];
+            char switchURI[128];
+            snprintf(switchURI, sizeof(switchURI), "x-rincon-queue:%s#0", rincon.c_str());
             snprintf(switchArgs, sizeof(switchArgs),
                 "<InstanceID>0</InstanceID>"
                 "<CurrentURI>%s</CurrentURI>"
@@ -1061,39 +1118,35 @@ bool SonosController::playPlaylist(const char* playlistID, const char* title) {
     String playlistNum = String(playlistID);
     playlistNum.replace("SQ:", "");
 
-    static char playlistURI[128];
+    char playlistURI[128];
     snprintf(playlistURI, sizeof(playlistURI),
              "file:///jffs/settings/savedqueues.rsq#%s", playlistNum.c_str());
 
     // Sonos requires DIDL-Lite metadata in EnqueuedURIMetaData for playlist URIs.
     // Without it, AddURIToQueue returns a SOAP Fault and the playlist never loads.
-    static char rawMeta[512];
-    snprintf(rawMeta, sizeof(rawMeta),
-        "<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\""
+    // String rather than a fixed buffer (same reason as playURI): a long title
+    // used to truncate the DIDL into malformed XML.
+    String rawMeta = String("<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\""
         " xmlns:dc=\"http://purl.org/dc/elements/1.1/\""
         " xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\""
-        " xmlns:r=\"urn:schemas-rinconnetworks-com:metadata-1-0/\">"
-        "<container id=\"%s\" parentID=\"SQ:\" restricted=\"false\">"
-        "<dc:title>%s</dc:title>"
-        "<upnp:class>object.container.playlistContainer</upnp:class>"
-        "<res protocolInfo=\"x-rincon-playlist:*:*:*\">%s</res>"
-        "</container>"
-        "</DIDL-Lite>",
-        playlistID, title, playlistURI);
+        " xmlns:r=\"urn:schemas-rinconnetworks-com:metadata-1-0/\">")
+        + "<container id=\"" + playlistID + "\" parentID=\"SQ:\" restricted=\"false\">"
+        + "<dc:title>" + title + "</dc:title>"
+        + "<upnp:class>object.container.playlistContainer</upnp:class>"
+        + "<res protocolInfo=\"x-rincon-playlist:*:*:*\">" + playlistURI + "</res>"
+        + "</container>"
+        + "</DIDL-Lite>";
 
     // encodeXML converts < > " & to &lt; &gt; &quot; &amp; so the DIDL
     // can be safely embedded as a SOAP field value.
-    String metaEncoded = String(rawMeta);
+    String metaEncoded = rawMeta;
     encodeXML(metaEncoded);
 
-    static char addArgs[1024];
-    snprintf(addArgs, sizeof(addArgs),
-        "<InstanceID>0</InstanceID>"
-        "<EnqueuedURI>%s</EnqueuedURI>"
-        "<EnqueuedURIMetaData>%s</EnqueuedURIMetaData>"
-        "<DesiredFirstTrackNumberEnqueued>1</DesiredFirstTrackNumberEnqueued>"
-        "<EnqueueAsNext>0</EnqueueAsNext>",
-        playlistURI, metaEncoded.c_str());
+    String addArgs = String("<InstanceID>0</InstanceID>")
+        + "<EnqueuedURI>" + playlistURI + "</EnqueuedURI>"
+        + "<EnqueuedURIMetaData>" + metaEncoded + "</EnqueuedURIMetaData>"
+        + "<DesiredFirstTrackNumberEnqueued>1</DesiredFirstTrackNumberEnqueued>"
+        + "<EnqueueAsNext>0</EnqueueAsNext>";
 
     Serial.printf("[PLAYLIST] Adding to queue: %s\n", playlistURI);
 
@@ -1108,7 +1161,7 @@ bool SonosController::playPlaylist(const char* playlistID, const char* title) {
     // on last_soap_http_code in the header.
     for (int attempt = 0; attempt < 3; attempt++) {
         int soap_code = 0;
-        resp = sendSOAP(transportTarget(), "AVTransport", "AddURIToQueue", addArgs, &soap_code);
+        resp = sendSOAP(transportTarget(), "AVTransport", "AddURIToQueue", addArgs.c_str(), &soap_code);
         if (resp.length() > 0 && resp.indexOf("Fault") < 0) {
             break;
         }
@@ -1131,9 +1184,9 @@ bool SonosController::playPlaylist(const char* playlistID, const char* title) {
     if (enqueued) {
         vTaskDelay(pdMS_TO_TICKS(200));
 
-        static char queueURI[128];
-        static char setArgs[256];
-        snprintf(queueURI, sizeof(queueURI), "x-rincon-queue:%s#0", dev->rinconID.c_str());
+        char queueURI[128];
+        char setArgs[256];
+        snprintf(queueURI, sizeof(queueURI), "x-rincon-queue:%s#0", rincon.c_str());
         snprintf(setArgs, sizeof(setArgs),
             "<InstanceID>0</InstanceID>"
             "<CurrentURI>%s</CurrentURI>"
@@ -1176,6 +1229,8 @@ bool SonosController::playPlaylist(const char* playlistID, const char* title) {
 }
 
 bool SonosController::playContainer(const char* containerURI, const char* metadata) {
+    PlayLockGuard play_lock("CONTAINER");
+    if (!play_lock.ok) return false;
     SonosDevice* dev = getCurrentDevice();
     if (!dev || !dev->connected) {
         Serial.println("[CONTAINER] Device not available");
@@ -1211,17 +1266,28 @@ bool SonosController::playContainer(const char* containerURI, const char* metada
 
     // Pre-switch to queue mode if something else (radio, line-in) holds the
     // transport, or RemoveAllTracksFromQueue below can land mid-transition.
+    String rincon;   // filled under deviceMutex below; used by the pre-switch and queueArgs
     {
         // Snapshot under deviceMutex — same cross-task String race as playPlaylist().
+        // rinconID is rewritten by discoverDevices() while a scan runs, and a
+        // Favorites tap can land during the (now background) scan, so it is copied
+        // in the same window and never read from dev->rinconID below.
         String uriNow;
         if (xSemaphoreTake(deviceMutex, pdMS_TO_TICKS(50))) {
             uriNow = dev->currentURI;
+            rincon = dev->rinconID;
             xSemaphoreGive(deviceMutex);
+        }
+        if (rincon.length() == 0) {
+            // Lock timed out (or no ID yet): "x-rincon-queue:#0" would only fail
+            // later, after the queue was already emptied.
+            Serial.println("[CONTAINER] Device ID unavailable - not loading");
+            return false;
         }
         bool alreadyQueue = uriNow.indexOf("rincon-queue") >= 0;
         if (!alreadyQueue) {
             String pre = "<InstanceID>0</InstanceID><CurrentURI>x-rincon-queue:"
-                       + dev->rinconID + "#0</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>";
+                       + rincon + "#0</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>";
             static const int preDelays[] = {200, 350, 500};
             for (int a = 0; a < 3; a++) {
                 String r = sendSOAP(transportTarget(), "AVTransport", "SetAVTransportURI", pre.c_str());
@@ -1296,7 +1362,7 @@ bool SonosController::playContainer(const char* containerURI, const char* metada
 
     vTaskDelay(pdMS_TO_TICKS(200));
     String queueArgs = String("<InstanceID>0</InstanceID><CurrentURI>x-rincon-queue:")
-                     + dev->rinconID + "#0</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>";
+                     + rincon + "#0</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>";
     String setResp;
     for (int attempt = 0; attempt < 3; attempt++) {
         setResp = sendSOAP(transportTarget(), "AVTransport", "SetAVTransportURI", queueArgs.c_str());
@@ -1899,10 +1965,7 @@ void SonosController::processCommand(CommandRequest_t* cmd) {
     switch (cmd->type) {
         case CMD_PLAY:
             sendSOAP(transportTarget(), "AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>");
-            if (xSemaphoreTake(deviceMutex, pdMS_TO_TICKS(50))) {
-                dev->isPlaying = true;
-                xSemaphoreGive(deviceMutex);
-            }
+            // isPlaying is left to the poll's GetTransportInfo, so the Play glyph changes only once Sonos reports PLAYING.
             notifyUI(UPDATE_PLAYBACK_STATE);
             break;
 
@@ -1944,12 +2007,12 @@ void SonosController::processCommand(CommandRequest_t* cmd) {
                 SonosDevice* coord = groupCoordinatorFor(dev);
                 snprintf(args, sizeof(args),
                     "<InstanceID>0</InstanceID><DesiredVolume>%d</DesiredVolume>",
-                    cmd->value);
+                    (int)cmd->value);
                 sendSOAP(coord, "GroupRenderingControl", "SetGroupVolume", args);
             } else {
                 snprintf(args, sizeof(args),
                     "<InstanceID>0</InstanceID><Channel>Master</Channel><DesiredVolume>%d</DesiredVolume>",
-                    cmd->value);
+                    (int)cmd->value);
                 sendSOAP("RenderingControl", "SetVolume", args);
             }
             if (xSemaphoreTake(deviceMutex, pdMS_TO_TICKS(50))) {
@@ -1971,12 +2034,12 @@ void SonosController::processCommand(CommandRequest_t* cmd) {
                 SonosDevice* coord = groupCoordinatorFor(target);
                 snprintf(args, sizeof(args),
                     "<InstanceID>0</InstanceID><DesiredVolume>%d</DesiredVolume>",
-                    cmd->value);
+                    (int)cmd->value);
                 sendSOAP(coord, "GroupRenderingControl", "SetGroupVolume", args);
             } else {
                 snprintf(args, sizeof(args),
                     "<InstanceID>0</InstanceID><Channel>Master</Channel><DesiredVolume>%d</DesiredVolume>",
-                    cmd->value);
+                    (int)cmd->value);
                 sendSOAP(target, "RenderingControl", "SetVolume", args);
             }
             if (xSemaphoreTake(deviceMutex, pdMS_TO_TICKS(50))) {
@@ -2007,12 +2070,12 @@ void SonosController::processCommand(CommandRequest_t* cmd) {
                 SonosDevice* coord = groupCoordinatorFor(dev);
                 snprintf(args, sizeof(args),
                     "<InstanceID>0</InstanceID><DesiredMute>%d</DesiredMute>",
-                    cmd->value);
+                    (int)cmd->value);
                 sendSOAP(coord, "GroupRenderingControl", "SetGroupMute", args);
             } else {
                 snprintf(args, sizeof(args),
                     "<InstanceID>0</InstanceID><Channel>Master</Channel><DesiredMute>%d</DesiredMute>",
-                    cmd->value);
+                    (int)cmd->value);
                 sendSOAP("RenderingControl", "SetMute", args);
             }
             if (xSemaphoreTake(deviceMutex, pdMS_TO_TICKS(50))) {
@@ -2059,13 +2122,13 @@ void SonosController::processCommand(CommandRequest_t* cmd) {
 
         case CMD_PLAY_QUEUE_ITEM: {
             Serial.printf("[CMD] PLAY_QUEUE_ITEM: track=%d | heap=%u dma=%u\n",
-                cmd->value,
+                (int)cmd->value,
                 heap_caps_get_free_size(MALLOC_CAP_DEFAULT),
                 heap_caps_get_free_size(MALLOC_CAP_DMA));
             art_download_in_progress = true;  // same race fix: suppress polling during Seek+Play+settle
             snprintf(args, sizeof(args),
                 "<InstanceID>0</InstanceID><Unit>TRACK_NR</Unit><Target>%d</Target>",
-                cmd->value);
+                (int)cmd->value);
             sendSOAP(transportTarget(), "AVTransport", "Seek", args);
             vTaskDelay(pdMS_TO_TICKS(100));
             sendSOAP(transportTarget(), "AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>");
@@ -2564,6 +2627,11 @@ void SonosController::resumeTasks() {
     // Recreate tasks after failed OTA (successful OTA reboots device)
     Serial.println("[SONOS] Recreating background tasks");
     sonos_tasks_shutdown_requested = false;  // Reset shutdown flag
+    // The tasks suspendTasks() waited on deleted themselves, and a self-deleted
+    // task's static TCB stays on the termination list until the idle task reaps
+    // it. Recreating on the same networkTaskTCB/pollingTaskTCB before that can
+    // corrupt the list. Same grace lyrics.cpp (requestLyrics, ~491-503) applies.
+    vTaskDelay(pdMS_TO_TICKS(LYRICS_TCB_REAP_MS));
     startTasks();  // This will recreate polling and network tasks
     Serial.println("[SONOS] ✓ Background tasks recreated");
 }
@@ -2813,14 +2881,17 @@ String SonosController::canonicalUuid(const String& uuid) {
 //
 // so coordinator, membership and member count all come from one SOAP.
 // ============================================================================
+// When group membership was last read, by either path (refreshGroupTopology or
+// the background speaker refresh, which parses the same payload).
+static unsigned long s_group_refresh_ms = 0;
+
 bool SonosController::refreshGroupTopology(bool force) {
     if (!devices || deviceCount == 0) return false;
 
     // Throttle: topology changes are rare and a stale read is harmless, but this can
     // be called from UI paths that fire repeatedly (slider drags, screen loads).
-    static unsigned long last_refresh_ms = 0;
-    if (!force && last_refresh_ms != 0 &&
-        (millis() - last_refresh_ms) < GROUP_TOPOLOGY_TTL_MS) {
+    if (!force && s_group_refresh_ms != 0 &&
+        (millis() - s_group_refresh_ms) < GROUP_TOPOLOGY_TTL_MS) {
         return true;   // cached state is still fresh enough
     }
 
@@ -2840,10 +2911,13 @@ bool SonosController::refreshGroupTopology(bool force) {
     // four String::replace() calls it replaces were order-dependent: &amp; had to
     // run last or "&amp;lt;" double-decoded into a tag the payload never contained.
     size_t declen = sonos_topology::decodeInPlace(&resp[0], resp.length());
+    return applyGroupTopology(resp.c_str(), declen) > 0;
+}
 
+int SonosController::applyGroupTopology(const char* buf, size_t declen) {
     // Reset before parsing: a speaker that has left a group must not keep stale
     // membership from the previous scan.
-    if (xSemaphoreTake(deviceMutex, pdMS_TO_TICKS(200)) != pdTRUE) return false;
+    if (xSemaphoreTake(deviceMutex, pdMS_TO_TICKS(200)) != pdTRUE) return 0;
     for (int i = 0; i < deviceCount; i++) {
         devices[i].isGroupCoordinator  = true;          // standalone until proven otherwise
         devices[i].groupCoordinatorUUID = devices[i].rinconID;
@@ -2858,7 +2932,7 @@ bool SonosController::refreshGroupTopology(bool force) {
 
     int unmatched = 0;
     int groups = sonos_topology::parseZoneGroups(
-        resp.c_str(), declen,
+        buf, declen,
         s_groups,  MAX_SONOS_DEVICES,
         s_members, MAX_SONOS_DEVICES * 2);
 
@@ -2926,12 +3000,12 @@ bool SonosController::refreshGroupTopology(bool force) {
     }
     xSemaphoreGive(deviceMutex);
 
-    last_refresh_ms = millis();
+    s_group_refresh_ms = millis();
     Serial.printf("[GROUP] Topology refreshed: %d group(s) across %d known device(s)%s\n",
                   groups, deviceCount,
                   unmatched ? " - SOME MEMBERS UNMATCHED, see above" : "");
     notifyUI(UPDATE_GROUPS);
-    return groups > 0;
+    return groups;
 }
 
 SonosDevice* SonosController::transportTarget() {

@@ -201,6 +201,41 @@
 #define OTA_BGCHECK_FIRST_MS    (10UL * 60UL * 1000UL)        // 10 min after boot
 #define OTA_BGCHECK_INTERVAL_MS (24UL * 60UL * 60UL * 1000UL) // then daily
 #define OTA_BGCHECK_RETRY_MS    (5UL * 60UL * 1000UL)         // busy radio: look again in 5 min
+// ── Background upkeep (sonos_sync.cpp) ──────────────────────────────────────
+// Every job here waits for an idle panel: no touch for SYNC_IDLE_MS, no artwork,
+// photo or firmware transfer in flight, and DMA above the artwork floor. A job
+// that finds the panel busy is postponed, never dropped.
+#define SYNC_IDLE_MS             8000UL                         // quiet this long before upkeep may run
+#define SYNC_POLL_MS             1000UL                         // how often the scheduler looks
+#define SYNC_TASK_STACK          8192                           // one-shot sync task, internal SRAM (NVS-safe)
+#define SYNC_TASK_RETRY_MS       60000UL                        // after a failed task create, wait this long
+#define SPEAKER_SYNC_FIRST_MS    (45UL * 1000UL)                // first refresh after boot
+#define SPEAKER_SYNC_INTERVAL_MS (4UL * 60UL * 60UL * 1000UL)   // then every 4 hours
+#define SPEAKER_ZERO_RETRY_MS    (10UL * 60UL * 1000UL)         // no speakers at all: look again soon
+// Opportunistic refresh: a panel left alone this long refreshes once an hour, not
+// only every 4 hours. One GetZoneGroupState call, so the cost is one SOAP.
+#define SPEAKER_IDLE_QUIET_MS    (5UL * 60UL * 1000UL)
+#define SPEAKER_IDLE_REFRESH_MS  (60UL * 60UL * 1000UL)
+// When no known speaker answers the topology call: a short SSDP probe that only
+// looks for ONE responder to ask instead. Never rewrites the speaker list.
+#define SSDP_PROBE_LISTEN_MS     4000UL
+// Deferred bring-up (no speaker reachable since boot): 30 s, 1, 2, 4, 8 min, then
+// every SPEAKER_ZERO_RETRY_MS. It used to retry every 10 s (#200, #208).
+#define DEFERRED_BACKOFF_BASE_MS 30000UL
+#define DAILY_CHECK_INTERVAL_MS  (24UL * 60UL * 60UL * 1000UL)  // selection + memory, once a day
+// "Out of memory" for the daily check. Two samples 15s apart must both be low, so
+// one art decode in flight cannot trigger a restart.
+#define MEM_MIN_INTERNAL_BYTES   (32UL * 1024UL)                // free internal heap
+#define MEM_MIN_PSRAM_BYTES      (4UL * 1024UL * 1024UL)        // free PSRAM
+#define MEM_RECHECK_MS           15000UL                        // gap between the two samples
+#define MEM_REBOOT_IDLE_MS       (2UL * 60UL * 1000UL)          // restart only after this long untouched
+// Favorites under the transport (Amber player).
+#define FAV_SHOWN                6
+#define FAV_REFRESH_MS           (30UL * 60UL * 1000UL)
+// Auto-update: install a newer release found by the daily check once nobody has
+// touched the panel for this long. Music playing does not delay it: the restart
+// does not stop the speaker. Off-switch lives on the Update screen.
+#define AUTOUPDATE_IDLE_MS       (5UL * 60UL * 1000UL)
 #define UPDATE_TOAST_HOLD_MS    14000   // visible before it fades itself out
 #define UPDATE_TOAST_FADE_MS    320     // slide + fade, in and out
 
@@ -481,7 +516,15 @@
 #define NVS_KEY_CACHED_DEVICE   "cached_dev"
 #define NVS_KEY_LYRICS          "lyrics"
 #define NVS_KEY_SHELF_CLOCK     "shelf_clock"    // Amber: clock in the player shelf (#199)
+#define NVS_KEY_AUTO_UPDATE     "auto_upd"       // install updates found by the daily check (default on)
+#define NVS_KEY_AUTO_UPD_VER    "auto_upd_ver"   // last version auto-install was attempted for
+#define NVS_KEY_LAST_SRC_KIND   "ls_kind"        // last played source: C container, U uri, P playlist
+#define NVS_KEY_LAST_SRC_URI    "ls_uri"
+#define NVS_KEY_LAST_SRC_META   "ls_meta"
+#define NVS_KEY_LAST_SRC_TITLE  "ls_title"
 #define NVS_KEY_ANALYTICS       "stats_on"     // anonymous install counter
+#define NVS_KEY_HA_ON           "ha_on"        // Home Assistant (ESPHome API) server, default off
+#define NVS_KEY_HA_DEBUG        "ha_debug"     // Home Assistant debug entities, default off
 #define NVS_KEY_BLUR_BG         "blur_bg"        // Blurred album-art backdrop (#49)
 #define NVS_KEY_OTA_PENDING     "ota_pending"    // Auto-reboot OTA flag
 #define NVS_KEY_OTA_URL         "ota_url"        // Saved firmware URL for auto-reboot OTA
@@ -509,9 +552,10 @@
 // CLOCK / SCREENSAVER
 // =============================================================================
 #define CLOCK_MODE_DISABLED    0  // Never show clock screen
-#define CLOCK_MODE_INACTIVITY  1  // Show after X mins no touch (any play state)
+// No mode shows the clock while music is playing, and starting playback closes it.
+#define CLOCK_MODE_INACTIVITY  1  // Show after X mins no touch, once playback is not running
 #define CLOCK_MODE_PAUSED      2  // Show only when paused/stopped + X mins inactivity
-#define CLOCK_MODE_NOTHING     3  // Show only when nothing playing + X mins inactivity
+#define CLOCK_MODE_NOTHING     3  // Show only when stopped with no track loaded + X mins inactivity
 
 // Clock face style (independent of CLOCK_MODE_*, which controls WHEN it appears)
 // Face indices. These are persisted in NVS, so the order is fixed — see the

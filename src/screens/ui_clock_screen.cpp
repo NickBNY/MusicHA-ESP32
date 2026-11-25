@@ -274,7 +274,7 @@ static void applyWeatherToWidgets() {
         snprintf(buf, sizeof(buf), "%d%s", clock_wx_temp, tempUnit());
         lv_label_set_text(clock_wx_temp_lbl, buf);
         lv_label_set_text(clock_wx_cond_lbl, wmoCondition(clock_wx_wmo));
-        snprintf(buf, sizeof(buf), "H: %d%%   W: %d km/h", clock_wx_humidity, clock_wx_wind);
+        snprintf(buf, sizeof(buf), "H: %d%%   W: %d %s", clock_wx_humidity, clock_wx_wind, clockWindUnit());
         lv_label_set_text(clock_wx_detail_lbl, buf);
         {
             struct tm _t = {};
@@ -713,8 +713,12 @@ static void fetchClockWeather() {
     // Request 7 hours: first entry is the current (already-started) hour, which
     // we skip when tm_min > 0, giving 6 strictly-future hours to display.
     // temperature_unit is passed directly so the API returns values in the right
-    // unit — no client-side conversion needed.
-    char url[350];
+    // unit — no client-side conversion needed. wind_speed_unit follows it, so
+    // Imperial gets mph and Metric km/h.
+    // The unit this request asks for. If the user flips the switch while the
+    // request is in flight, the reply is in the old unit and is dropped below.
+    const bool req_imperial = clock_wx_fahrenheit;
+    char url[384];
     snprintf(url, sizeof(url),
         "https://api.open-meteo.com/v1/forecast"
         "?latitude=%.2f&longitude=%.2f"
@@ -722,8 +726,10 @@ static void fetchClockWeather() {
         "&hourly=weather_code,temperature_2m&forecast_hours=7"
         "&daily=sunrise,sunset&forecast_days=2"
         "&timezone=auto"
-        "&temperature_unit=%s",
-        lat, lon, clock_wx_fahrenheit ? "fahrenheit" : "celsius");
+        "&temperature_unit=%s"
+        "&wind_speed_unit=%s",
+        lat, lon, req_imperial ? "fahrenheit" : "celsius",
+        req_imperial ? "mph" : "kmh");
 
     for (int attempt = 1; attempt <= 2 && !clock_bg_shutdown_requested; attempt++) {
         // SDIO crash-defence: general + HTTPS cooldowns before Open-Meteo HTTPS.
@@ -751,7 +757,13 @@ static void fetchClockWeather() {
                 DynamicJsonDocument doc(3072);
                 auto err = deserializeJson(doc, body);
                 body = String();  // Free immediately after parse
-                if (err == DeserializationError::Ok) {
+                if (err == DeserializationError::Ok && req_imperial != clock_wx_fahrenheit) {
+                    // Unit switched mid-request: these numbers are in the old
+                    // unit. Keep the refetch pending and stop retrying.
+                    Serial.println("[CLKWX] Unit changed during fetch, discarding reply");
+                    clock_weather_needs_refetch = true;
+                    success = true;
+                } else if (err == DeserializationError::Ok) {
                     int cur_temp = (int)roundf(doc["current"]["temperature_2m"].as<float>());
                     int humidity = doc["current"]["relative_humidity_2m"].as<int>();
                     int wmo      = doc["current"]["weather_code"].as<int>();
@@ -817,9 +829,12 @@ static void fetchClockWeather() {
                     clock_wx_valid        = true;
                     clock_weather_updated = true;
 
-                    Serial.printf("[CLKWX] %d°C feels=%d°C uv=%d rise=%s set=%s wmo=%d hum=%d%% wind=%dkm/h city=%s\n",
-                                  cur_temp, apparent, uv_idx, sunrise_str, sunset_str,
-                                  wmo, humidity, wind, clock_wx_city_name);
+                    Serial.printf("[CLKWX] %d°%c feels=%d°%c uv=%d rise=%s set=%s wmo=%d hum=%d%% wind=%d%s city=%s\n",
+                                  cur_temp, req_imperial ? 'F' : 'C',
+                                  apparent, req_imperial ? 'F' : 'C',
+                                  uv_idx, sunrise_str, sunset_str,
+                                  wmo, humidity, wind, req_imperial ? "mph" : "km/h",
+                                  clock_wx_city_name);
                     success = true;
                 } else {
                     Serial.printf("[CLKWX] JSON error: %s (attempt %d/2)\n", err.c_str(), attempt);
@@ -1519,6 +1534,23 @@ void exitClockScreen() {
 // Drives the clock state machine without blocking the main thread.
 // ============================================================================
 void checkClockTrigger() {
+    // Track how long ui_playing has been continuously false. Updated on EVERY
+    // call, before any state or early return: if it only ran once the
+    // inactivity timeout had passed, a stamp left over from an earlier pause
+    // would make a fresh ~300-500ms isPlaying=false blip (Sonos HLS track
+    // transition) look like minutes of silence and defeat the 2s debounce.
+    static bool     s_was_not_playing   = false;
+    static uint32_t s_not_playing_since = 0;
+    if (!ui_playing) {
+        if (!s_was_not_playing) {
+            s_was_not_playing   = true;
+            s_not_playing_since = millis();
+        }
+    } else {
+        s_was_not_playing   = false;
+        s_not_playing_since = 0;
+    }
+
     switch (clock_state) {
 
         // ------------------------------------------------------------------
@@ -1546,7 +1578,7 @@ void checkClockTrigger() {
                     uint32_t inact_ms  = (uint32_t)clock_timeout_min * 60000UL;
                     uint32_t since_exit  = millis() - last_clock_exit_ms;
                     uint32_t since_touch = millis() - last_touch_time;
-                    bool trig = (clock_mode == CLOCK_MODE_INACTIVITY) ? true
+                    bool trig = (clock_mode == CLOCK_MODE_INACTIVITY) ? !ui_playing
                               : (clock_mode == CLOCK_MODE_PAUSED)     ? !ui_playing
                               : (clock_mode == CLOCK_MODE_NOTHING)    ? (!ui_playing && ui_title.isEmpty())
                               : false;
@@ -1563,20 +1595,11 @@ void checkClockTrigger() {
             uint32_t inactivity_ms = (uint32_t)clock_timeout_min * 60000UL;
             if (millis() - last_touch_time < inactivity_ms) return;
 
-            // Track how long ui_playing has been continuously false.
-            // PAUSED/NOTHING modes debounce for 2s to ignore the brief isPlaying=false
-            // (~300-500ms) that Sonos reports during HLS track transitions.
-            static bool   s_was_not_playing   = false;
-            static uint32_t s_not_playing_since = 0;
-            if (!ui_playing) {
-                if (!s_was_not_playing) {
-                    s_was_not_playing   = true;
-                    s_not_playing_since = millis();
-                }
-            } else {
-                s_was_not_playing   = false;
-                s_not_playing_since = 0;
-            }
+            // Never take over the player while music is playing, in any mode. The
+            // small clock on the player shows the time instead. Every mode also
+            // waits out the 2s debounce below, which ignores the brief
+            // isPlaying=false (~300-500ms) Sonos reports between HLS tracks.
+            if (ui_playing) return;
             uint32_t not_playing_ms = s_was_not_playing ? millis() - s_not_playing_since : 0;
 
             // "paused and stable" = not-playing for 2s AND no art download in progress.
@@ -1589,7 +1612,7 @@ void checkClockTrigger() {
 
             bool trigger = false;
             switch (clock_mode) {
-                case CLOCK_MODE_INACTIVITY: trigger = true;                                           break;
+                case CLOCK_MODE_INACTIVITY: trigger = paused_and_stable;                              break;
                 case CLOCK_MODE_PAUSED:     trigger = paused_and_stable;                              break;
                 case CLOCK_MODE_NOTHING:    trigger = paused_and_stable && ui_title.isEmpty();        break;
             }
@@ -1685,8 +1708,8 @@ void checkClockTrigger() {
             // trigger inside that window. The top layer is per-display and
             // draws above every screen, so the pill would sit over the clock
             // and take the user's first tap — the tap that would otherwise
-            // reach scr_clock's CLICKED handler, the only caller of
-            // exitClockScreen() in CLOCK_MODE_INACTIVITY. Loading scr_ota from
+            // reach scr_clock's CLICKED handler, the only way out of the clock
+            // while nothing is playing. Loading scr_ota from
             // under it strands clock_state at CLOCK_ACTIVE with
             // art_shutdown_requested set: no album art, no lyrics, clockBgTask
             // still fetching photos, and no recovery short of a reboot.
@@ -1703,11 +1726,9 @@ void checkClockTrigger() {
 
         // ------------------------------------------------------------------
         case CLOCK_ACTIVE: {
-            // Auto-dismiss when music starts playing — but NOT for CLOCK_MODE_INACTIVITY.
-            // That mode shows the clock regardless of play state (dismiss by touch only).
-            // For PAUSED / NOTHING modes the clock only made sense because nothing was playing,
-            // so resuming playback should close it.
-            if (ui_playing && clock_mode != CLOCK_MODE_INACTIVITY) {
+            // Auto-dismiss when music starts playing, in every mode: the player
+            // (with its small clock) is where playback belongs.
+            if (ui_playing) {
                 Serial.println("[CLOCK] Music playing — auto-exiting clock");
                 exitClockScreen();
                 break;

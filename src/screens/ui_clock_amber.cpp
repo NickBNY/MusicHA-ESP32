@@ -362,7 +362,7 @@ void amberFaceTick(const struct tm* now) {
     lv_label_set_text_fmt(af_feel, "feels %d°", clock_wx_apparent);
 
     lv_label_set_text_fmt(af_val[0], "%d%%",    clock_wx_humidity);
-    lv_label_set_text_fmt(af_val[1], "%d km/h", clock_wx_wind);
+    lv_label_set_text_fmt(af_val[1], "%d %s", clock_wx_wind, clockWindUnit());
     lv_label_set_text_fmt(af_val[2], "%d",      clock_wx_uv);
     lv_label_set_text_fmt(af_val[3], "%s - %s", clock_wx_sunrise, clock_wx_sunset);
 

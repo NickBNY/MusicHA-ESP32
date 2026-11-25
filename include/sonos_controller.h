@@ -106,6 +106,8 @@ struct SonosDevice {
     bool isRadioStation;          // True if playing radio (detected by URI pattern)
     bool isLineIn;                // True if playing from line-in (x-rincon-stream: URI)
     bool hasLineIn;               // Player HAS a physical line-in (Five/Amp/Port/Beam; not One/SL)
+    bool lineInKnown;             // hasLineIn came from a fetched description (false: a default,
+                                  // persisted as '?' and asked again on the next refresh)
     bool isTvAudio;               // True if playing TV audio (x-sonos-htastream: URI)
     String currentURI;            // Track URI (needed for radio detection)
     String radioStationName;      // Station name from GetMediaInfo's CurrentURIMetaData
@@ -136,8 +138,9 @@ private:
     SonosDevice* devices;
     int deviceCount;
     int currentDeviceIndex;
-    // True while discoverDevices() rewrites devices[] (issue #165). The battery
-    // poll on the polling task reads the list and has to stay out meanwhile.
+    // True while discoverDevices() or the background speaker refresh rewrites
+    // devices[] (issue #165). The battery poll on the polling task reads the list
+    // and has to stay out meanwhile. Set only through tryBeginScan().
     volatile bool discovering = false;
 
     // Sleep timer (issue #173). The speaker holds the countdown; these hold the
@@ -201,9 +204,30 @@ private:
     // Returns false when the device description could not be fetched or parsed,
     // in which case dev->hasLineIn is a DEFAULT (false) and not a result. Callers
     // that persist the flag must check this, or one timed-out 3s fetch is cached
-    // as "this speaker has no line-in" for good.
+    // as "this speaker has no line-in" for good. dev->lineInKnown records which
+    // of the two it is (set on HTTP 200, cleared on a failed GET).
     bool getRoomName(SonosDevice* dev);
-    int fetchTopologyCoordinators(IPAddress ip, String* coordinatorRINCONs, int maxCount);
+    int loadCachedDeviceList();      // appends remembered speakers after slot 0; returns how many
+    // One scan/refresh at a time (discoverDevices, refreshSpeakers*). Atomic
+    // test-and-set of `discovering`; endScan() clears it.
+    bool tryBeginScan();
+    void endScan();
+    // Applies one GetZoneGroupState response (raw SOAP body) to devices[]: rooms
+    // added / renamed / re-addressed / removed, then groups. Caller holds the scan
+    // slot. Returns the room count, or -1 when the payload lists no rooms.
+    int applySpeakerTopology(String& resp);
+    // Group membership from an entity-decoded, lowercased ZoneGroupState buffer.
+    // Shared by refreshGroupTopology() and the speaker refresh, which already has
+    // the payload and so saves a second SOAP. Returns the group count.
+    int applyGroupTopology(const char* buf, size_t len);
+    // Short SSDP M-SEARCH that only collects responder addresses; never touches
+    // devices[]. Returns how many were written to `out`.
+    int ssdpProbe(IPAddress* out, int maxOut, uint32_t listenMs);
+    // hidden/hiddenCount (optional) receive the RINCON of every bonded Sub, surround
+    // and invisible pair half in the same payload (issue #211).
+    int fetchTopologyCoordinators(IPAddress ip, String* coordinatorRINCONs, int maxCount,
+                                  String* hidden = nullptr, int maxHidden = 0,
+                                  int* hiddenCount = nullptr);
     bool fetchDevicePlayingState(SonosDevice* dev);
     int timeToSeconds(const String& time);
     void notifyUI(UIUpdateType_e type);
@@ -235,7 +259,31 @@ public:
     void startTasks();
     
     // Discovery
-    int discoverDevices();
+    // background = true when called off the UI task (the periodic refresh): it
+    // never touches LVGL and never feeds the task watchdog it is not part of.
+    int discoverDevices(bool background = false);
+
+    // ── Speaker memory ──────────────────────────────────────────────────────
+    // The whole speaker list, each speaker's group and the last selection are
+    // kept in NVS, so a reboot (or a speaker that is asleep at boot) no longer
+    // leaves the panel with one cached room and an empty Groups screen.
+    void cacheDeviceList();
+    // Non-destructive refresh from ONE GetZoneGroupState call: updates names and
+    // addresses, adds new rooms, drops rooms that left the system (never the
+    // selected one) and re-reads groups from the same payload. No SSDP, so it is
+    // cheap enough to run in the background while music plays. Asks the selected
+    // speaker first, then up to two others. Returns the number of rooms, or -1
+    // when none of them answered. Never empties the list.
+    int refreshSpeakersFromTopology();
+    // Fallback when no known speaker answers: a short SSDP probe (no listing, no
+    // per-speaker fetches) finds any speaker, and the same topology call is made to
+    // it. Same return convention; the list is untouched on -1.
+    int refreshSpeakersViaProbe();
+    // Re-select the speaker that was selected last (by RINCON, then IP) when
+    // nothing is selected. Returns true when a selection exists afterwards.
+    bool selectLastSelection();
+    // True once the Sonos network and polling tasks have been started.
+    bool tasksRunning() const { return pollingTaskHandle != nullptr; }
     String getCachedDeviceIP();
     void cacheDeviceIP(String ip);
     bool tryLoadCachedDevice();        // Try to load cached device from NVS (fast boot)

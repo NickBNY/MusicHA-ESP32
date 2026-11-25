@@ -71,6 +71,17 @@ warn on a mismatch — do not ignore that warning.
 If the build is gone, the reset reason and the register dump above are still
 valid; only the symbol names are lost.
 
+The `build :` value in the boot summary is the start of that `app_elf_sha256`,
+so it names the exact image even when the version number does not.
+
+**Release builds cannot be symbolised today.** GitHub releases carry the `.bin`
+images only, not `firmware.elf`, and a local rebuild of the same tag is not
+guaranteed to produce the same ELF. For a crash on a release build, the task
+name, PC and `mcause` in the summary are what you have. Two crash reports
+([#200](https://github.com/OpenSurface/SonosESP/issues/200),
+[#208](https://github.com/OpenSurface/SonosESP/issues/208)) were read that way:
+see [Troubleshooting](TROUBLESHOOTING.md#crashed-with-task-sdio_read-or-sdio_rx_buf).
+
 ### Saving the raw dump
 
 To archive it before it is overwritten, or to hand it to someone else:

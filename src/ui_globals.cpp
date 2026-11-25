@@ -56,6 +56,7 @@ int  night_level      = BRIGHTNESS_DIM_MIN;
 int  night_touch_level = DEFAULT_NIGHT_TOUCH;
 volatile uint32_t night_wake_ms = 0;
 bool lyrics_enabled = true;
+bool auto_update_enabled = true;
 // Amber only: the player shelf shows a clock instead of Next-up / lyrics (#199).
 // Off by default - it REPLACES two existing panes, so an existing device must
 // look unchanged until its owner asks for it.
@@ -70,6 +71,7 @@ bool blur_bg_enabled = true;
 String pending_wifi_ssid;
 String pending_wifi_pass;
 volatile bool wifi_creds_need_save = false;
+volatile bool wifi_user_op_in_progress = false;
 volatile uint32_t last_touch_time = 0;
 volatile bool screen_dimmed = false;
 

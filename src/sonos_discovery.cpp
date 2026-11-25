@@ -5,20 +5,48 @@
 
 #include "sonos_controller.h"
 #include "ui_common.h"
+#include "sonos_topology.h"
+#include "sonos_sync_logic.h"
 #include <esp_task_wdt.h>
 
 // ============================================================================
 // Discovery
 // ============================================================================
-int SonosController::discoverDevices() {
-    // Set before deviceCount goes to 0, cleared on every return by the guard's
-    // destructor. batteryPollStep() checks it and leaves devices[] alone while
-    // this rewrites it from the UI task (issue #165).
-    struct DiscoveringFlag {
-        volatile bool& flag;
-        explicit DiscoveringFlag(volatile bool& f) : flag(f) { flag = true; }
-        ~DiscoveringFlag() { flag = false; }
-    } discovering_guard(discovering);
+int SonosController::discoverDevices(bool background) {
+    // Off the UI task this must not touch LVGL (lv_refr_now from another task
+    // races the renderer) or feed a task watchdog it is not subscribed to.
+    auto wdt = [background]() { if (!background) esp_task_wdt_reset(); };
+    auto ui  = [background](uint32_t ms) { if (!background) { lv_tick_inc(ms); lv_refr_now(NULL); } };
+
+    // One scan at a time. The background refresh, the deferred bring-up and the
+    // Scan button can all ask. A Scan press waits for a background refresh to
+    // finish (a few seconds; the spinner keeps turning) and then scans, because a
+    // button labelled Scan must scan. A background caller never waits: it reports
+    // what is there and lets the schedule try again.
+    if (!tryBeginScan()) {
+        if (background) {
+            Serial.println("[SONOS] A scan is already running - not starting another");
+            return deviceCount;
+        }
+        const uint32_t t0 = millis();
+        while (!tryBeginScan()) {
+            if ((uint32_t)(millis() - t0) > 25000UL) {
+                Serial.println("[SONOS] Previous scan still running after 25 s - not scanning");
+                return deviceCount;
+            }
+            wdt();
+            ui(20);
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+    }
+
+    // Held from here until every return: set before deviceCount goes to 0 and
+    // cleared by the destructor. batteryPollStep() checks it and leaves devices[]
+    // alone while this rewrites it (issue #165).
+    struct ScanSlot {
+        SonosController* c;
+        ~ScanSlot() { c->endScan(); }
+    } scan_slot{this};
 
     if (!devices) { Serial.println("[SONOS] devices array not allocated"); return 0; }
     Serial.printf("[SONOS] Starting discovery...\n");
@@ -145,6 +173,9 @@ int SonosController::discoverDevices() {
                         // RINCON, two entries then claim the same id, and the Groups screen
                         // renders a phantom speaker named by its bare IP.
                         devices[deviceCount].rinconID = "";
+                        // Same for capabilities: unknown until getRoomName() answers.
+                        devices[deviceCount].hasLineIn = false;
+                        devices[deviceCount].lineInKnown = false;
                         devices[deviceCount].isPlaying = false;
                         devices[deviceCount].volume = 50;
                         devices[deviceCount].isMuted = false;
@@ -176,8 +207,7 @@ int SonosController::discoverDevices() {
 
         // Update UI periodically to keep spinner animating
         if (millis() - lastUIUpdate > 20) {
-            lv_tick_inc(20);
-            lv_refr_now(NULL);  // Force display refresh
+            ui(20);   // Force display refresh (UI task only)
             lastUIUpdate = millis();
         }
 
@@ -222,7 +252,7 @@ int SonosController::discoverDevices() {
     Serial.printf("[SONOS] Fetching room names for %d device(s)...\n", deviceCount);
     for (int i = 0; i < deviceCount; i++) {
         Serial.printf("[SONOS] Fetching room name %d/%d from %s\n", i + 1, deviceCount, devices[i].ip.toString().c_str());
-        esp_task_wdt_reset();  // Each getRoomName() takes ~1-2s; 17 devices × 2s = 34s > 30s WDT
+        wdt();  // Each getRoomName() takes ~1-2s; 17 devices × 2s = 34s > 30s WDT
 
         bool ok = getRoomName(&devices[i]);
         for (int attempt = 1; !ok && attempt <= DISCOVERY_ROOMNAME_RETRIES; attempt++) {
@@ -231,7 +261,7 @@ int SonosController::discoverDevices() {
             // Let whoever holds network_mutex finish. Short enough that the worst
             // case stays inside the watchdog window, which is fed each iteration.
             vTaskDelay(pdMS_TO_TICKS(DISCOVERY_ROOMNAME_RETRY_MS));
-            esp_task_wdt_reset();
+            wdt();
             ok = getRoomName(&devices[i]);
         }
         if (!ok) {
@@ -241,8 +271,7 @@ int SonosController::discoverDevices() {
         Serial.printf("[SONOS]   -> Room name: '%s'\n", devices[i].roomName.c_str());
 
         // Update UI while fetching room names
-        lv_tick_inc(10);
-        lv_refr_now(NULL);
+        ui(10);
     }
 
     // Drop anything that answered SSDP but never resolved into a real speaker.
@@ -296,10 +325,17 @@ int SonosController::discoverDevices() {
     const int MAX_COORDINATORS = 16;
     String coordinatorRINCONs[MAX_COORDINATORS];
     int coordCount = 0;
+    // Bonded subs, surrounds and the second half of a stereo pair, by RINCON
+    // (issue #211). Filled by the same GetZoneGroupState call; stays empty when
+    // the topology request fails, which leaves the discovery result as it was.
+    const int MAX_HIDDEN = 16;
+    String hiddenRincons[MAX_HIDDEN];
+    int hiddenCount = 0;
     if (deviceCount > 0) {
-        esp_task_wdt_reset();  // getRoomName loop may have consumed most of the WDT window
+        wdt();  // getRoomName loop may have consumed most of the WDT window
         Serial.printf("[SONOS] Fetching zone topology from %s...\n", devices[0].ip.toString().c_str());
-        coordCount = fetchTopologyCoordinators(devices[0].ip, coordinatorRINCONs, MAX_COORDINATORS);
+        coordCount = fetchTopologyCoordinators(devices[0].ip, coordinatorRINCONs, MAX_COORDINATORS,
+                                               hiddenRincons, MAX_HIDDEN, &hiddenCount);
         if (coordCount == 0) {
             Serial.printf("[SONOS] Topology unavailable - falling back to first-seen deduplication\n");
         }
@@ -402,6 +438,27 @@ int SonosController::discoverDevices() {
         Serial.printf("[SONOS] No duplicates found - all %d devices are unique\n", uniqueCount);
     }
     deviceCount = uniqueCount;
+
+    // Drop bonded Subs / Sub Minis, surrounds and invisible pair halves (#211).
+    // After the stereo-pair dedup on purpose: that pass reads the twin's address
+    // for the battery badge, and only needs the twin to still be present.
+    // Never drops the last speaker, so a mis-parse cannot empty the list.
+    if (hiddenCount > 0) {
+        int kept = 0;
+        for (int i = 0; i < deviceCount; i++) {
+            bool hide = false;
+            for (int h = 0; h < hiddenCount && !hide; h++)
+                hide = uuidEquals(devices[i].rinconID, hiddenRincons[h]);
+            if (hide && deviceCount - (i - kept) > 1) {
+                Serial.printf("[SONOS]   [BONDED/HIDDEN] '%s' (%s) excluded by topology\n",
+                              devices[i].roomName.c_str(), devices[i].ip.toString().c_str());
+                continue;
+            }
+            if (i != kept) devices[kept] = devices[i];
+            kept++;
+        }
+        deviceCount = kept;
+    }
     if (dedup_locked) xSemaphoreGive(deviceMutex);
 
     // Re-point the selection at the same speaker, wherever it landed.
@@ -442,19 +499,23 @@ int SonosController::discoverDevices() {
         // Same reason as the room-name loop above: fetchDevicePlayingState() blocks
         // for up to its 3s HTTP timeout, and MAX_SONOS_DEVICES is 32 — 11 slow zones
         // already exceeds the 30s WDT, and this runs on the WDT-subscribed mainAppTask.
-        esp_task_wdt_reset();
+        wdt();
         devices[i].isPlaying = fetchDevicePlayingState(&devices[i]);
         Serial.printf("[SONOS]   '%s' (%s): %s\n",
             devices[i].roomName.c_str(), devices[i].ip.toString().c_str(),
             devices[i].isPlaying ? "PLAYING" : "stopped");
         // Keep UI alive during the SOAP calls
-        lv_tick_inc(10);
-        lv_refr_now(NULL);
+        ui(10);
     }
 
     if (deviceCount > 0) {
         prefs.putString("device_ip", devices[0].ip.toString());
+        // Remember the whole list, not just the selected room, so the next boot
+        // starts with every speaker and group instead of one.
+        cacheDeviceList();
     }
+    // Off the UI task nobody repaints the speaker and group screens for us.
+    if (background) notifyUI(UPDATE_GROUPS);
 
     Serial.printf("[SONOS] Discovery complete: %d visible zone(s)\n", deviceCount);
     return deviceCount;
@@ -467,7 +528,9 @@ int SonosController::discoverDevices() {
 // NOTE: /status/topology was deprecated and no longer returns coordinator info on modern
 // Sonos firmware. GetZoneGroupState (ZoneGroupTopology service) is the correct API.
 // The ZoneGroupState inner XML may be HTML-entity-encoded inside the SOAP response.
-int SonosController::fetchTopologyCoordinators(IPAddress ip, String* coordinatorRINCONs, int maxCount) {
+int SonosController::fetchTopologyCoordinators(IPAddress ip, String* coordinatorRINCONs, int maxCount,
+                                               String* hidden, int maxHidden, int* hiddenCount) {
+    if (hiddenCount) *hiddenCount = 0;
     HTTPClient http;
     char url[128];
     snprintf(url, sizeof(url), "http://%s:1400/ZoneGroupTopology/Control", ip.toString().c_str());
@@ -500,7 +563,8 @@ int SonosController::fetchTopologyCoordinators(IPAddress ip, String* coordinator
     http.addHeader("Content-Type", "text/xml; charset=\"utf-8\"");
     http.addHeader("SOAPAction", "\"urn:schemas-upnp-org:service:ZoneGroupTopology:1#GetZoneGroupState\"");
 
-    esp_task_wdt_reset();  // belt-and-suspenders: http.setTimeout(3000) bounds this call
+    if (esp_task_wdt_status(NULL) == ESP_OK) esp_task_wdt_reset();  // only when subscribed (not the background sync task)
+    //                     http.setTimeout(3000) bounds this call
                            // but WDT reset ensures no 30s window overrun even if timeout
                            // fires at the edge of the window (e.g. 17 × 2s = 34s loop)
     int count = 0;
@@ -533,6 +597,17 @@ int SonosController::fetchTopologyCoordinators(IPAddress ip, String* coordinator
             searchPos = end + 1;
         }
         Serial.printf("[SONOS] Topology: %d coordinator(s) found\n", count);
+
+        // Bonded / invisible members, from the same payload (issue #211).
+        if (hidden && hiddenCount && maxHidden > 0) {
+            static sonos_topology::Member s_members[48];   // one caller at a time: discovery is serialised
+            const int n = sonos_topology::parseMembers(xml.c_str(), xml.length(), s_members, 48);
+            for (int i = 0; i < n && *hiddenCount < maxHidden; i++) {
+                if (!s_members[i].hidden) continue;
+                hidden[*hiddenCount] = String(s_members[i].uuid.ptr, s_members[i].uuid.len);
+                (*hiddenCount)++;
+            }
+        }
     } else {
         Serial.printf("[SONOS] GetZoneGroupState failed (HTTP %d)\n", code);
     }
@@ -621,6 +696,7 @@ bool SonosController::getRoomName(SonosDevice* dev) {
                       code, dev->ip.toString().c_str());
         if (xSemaphoreTake(deviceMutex, pdMS_TO_TICKS(100))) {
             dev->hasLineIn = false;   // default off: a failed fetch must not offer a dead row
+            dev->lineInKnown = false; // ...but remembered as unknown, so it is asked again
             xSemaphoreGive(deviceMutex);
         }
         return false;
@@ -661,6 +737,7 @@ bool SonosController::getRoomName(SonosDevice* dev) {
         // it advertises the AudioIn service here. Five/Amp/Port/Beam do; One
         // and SL do not, and offering them a Line-In source would be a dead row.
         dev->hasLineIn = hasLineIn;
+        dev->lineInKnown = true;
         if (roomName.length() > 0) dev->roomName = roomName;
         if (rincon.length()   > 0) dev->rinconID = rincon;
         xSemaphoreGive(deviceMutex);
@@ -697,7 +774,10 @@ void SonosController::cacheSelectedDevice() {
     // Line-in capability is discovered from device_description.xml and is NOT
     // re-derivable on the fast-boot path, so it has to be cached with the rest
     // or the Sources screen loses its Line-In row on every reboot.
-    prefs.putInt("cached_linein", dev->hasLineIn ? 1 : 0);
+    // Only a fetched value: an unknown one leaves the key unset (-1 on read), so
+    // the next fast boot resolves it instead of trusting a default false.
+    if (dev->lineInKnown) prefs.putInt("cached_linein", dev->hasLineIn ? 1 : 0);
+    else if (prefs.isKey("cached_linein")) prefs.remove("cached_linein");
 
     Serial.printf("[SONOS] Cached device: %s (%s) [%s]\n",
                   dev->roomName.c_str(),
@@ -787,7 +867,12 @@ bool SonosController::tryLoadCachedDevice() {
             Serial.println("[SONOS]   Line-in fetch failed - not caching, will retry");
     } else {
         devices[0].hasLineIn = (cachedLineIn == 1);
+        devices[0].lineInKnown = true;
     }
+
+    // The rest of the remembered system: every other speaker, with its group.
+    // The selected speaker stays in slot 0 (callers rely on it).
+    const int remembered = loadCachedDeviceList();
 
     Serial.println("========================================");
     Serial.println("[SONOS] ✓ FAST BOOT: Device loaded from NVS cache");
@@ -795,9 +880,427 @@ bool SonosController::tryLoadCachedDevice() {
     Serial.printf("[SONOS]   IP: %s\n", cachedIP.c_str());
     Serial.printf("[SONOS]   RINCON: %s\n", cachedRincon.c_str());
     Serial.printf("[SONOS]   Line-in: %s\n", devices[0].hasLineIn ? "yes" : "no");
+    Serial.printf("[SONOS]   Remembered speakers: %d (refreshed in the background)\n", remembered + 1);
     Serial.println("[SONOS]   Boot time saved: ~13 seconds");
-    Serial.println("[SONOS]   To scan for other devices: Settings → Speakers → Scan");
     Serial.println("========================================");
 
     return true;
+}
+
+// ============================================================================
+// Speaker memory
+// ----------------------------------------------------------------------------
+// One NVS blob holds the whole system as the panel last saw it: a line per room,
+//     ip|RINCON|room name|line-in 1/0/?|pair ip|coordinator RINCON|members
+// where '?' means the description was never fetched (asked again on refresh).
+// so a reboot starts with every speaker and every group already on screen. The
+// background refresh (sonos_sync.cpp) then corrects whatever changed while the
+// panel was off. Text, not a packed struct, so a firmware that adds a field is
+// still able to read what an older one wrote.
+// ============================================================================
+#define DEVLIST_KEY      "dev_list"
+#define DEVLIST_MAX_BYTES 3900
+
+static void resetDeviceSlot(SonosDevice& d, const IPAddress& ip,
+                            const String& room, const String& rincon) {
+    d.ip = ip;
+    d.pairIP = IPAddress();
+    d.roomName = room;
+    d.rinconID = rincon;
+    d.name = "";
+    d.isPlaying = false;
+    d.volume = 50;
+    d.isMuted = false;
+    d.shuffleMode = false;
+    d.repeatMode = "NONE";
+    d.currentTrack = "";
+    d.currentArtist = "";
+    d.currentAlbum = "";
+    d.albumArtURL = "";
+    d.currentURI = "";
+    d.isRadioStation = d.isLineIn = d.isTvAudio = false;
+    d.hasLineIn = false;
+    d.lineInKnown = false;
+    d.connected = false;
+    d.errorCount = 0;
+    d.currentTrackNumber = 0;
+    d.totalTracks = 0;
+    d.queueSize = 0;
+    d.groupCoordinatorUUID = rincon;     // standalone until the topology says otherwise
+    d.isGroupCoordinator = true;
+    d.groupMemberCount = 1;
+}
+
+static String sanitizeField(String v) {
+    v.replace("|", " ");
+    v.replace("\n", " ");
+    v.replace("\r", " ");
+    return v;
+}
+
+void SonosController::cacheDeviceList() {
+    if (!devices || deviceCount <= 0) return;
+    String out;
+    out.reserve(1024);
+    if (xSemaphoreTake(deviceMutex, pdMS_TO_TICKS(200)) != pdTRUE) return;   // next refresh will retry
+    for (int i = 0; i < deviceCount; i++) {
+        const SonosDevice& d = devices[i];
+        if (d.rinconID.length() == 0) continue;            // unidentified: nothing worth remembering
+        String line;
+        line += d.ip.toString();                           line += '|';
+        line += d.rinconID;                                line += '|';
+        line += sanitizeField(d.roomName);                 line += '|';
+        line += sonos_sync::lineInField(d.lineInKnown, d.hasLineIn); line += '|';
+        line += ((uint32_t)d.pairIP != 0) ? d.pairIP.toString() : String("");
+        line += '|';
+        line += d.groupCoordinatorUUID;                    line += '|';
+        line += String(d.groupMemberCount);                line += '\n';
+        if (out.length() + line.length() > DEVLIST_MAX_BYTES) break;   // keep what fits
+        out += line;
+    }
+    xSemaphoreGive(deviceMutex);
+    if (out.length() == 0) return;
+
+    // Skip the flash write when nothing changed: NVS wear is the one cost of a
+    // 4-hourly refresh that is worth avoiding.
+    String prev = prefs.getString(DEVLIST_KEY, "");
+    if (prev == out) return;
+    prefs.putString(DEVLIST_KEY, out);
+    Serial.printf("[SONOS] Remembered %d speaker(s) for the next boot\n", deviceCount);
+}
+
+// Appends the remembered speakers other than slot 0 (the selected one) and
+// restores their groups. Returns how many were added.
+int SonosController::loadCachedDeviceList() {
+    if (!devices || deviceCount < 1) return 0;
+    String blob = prefs.getString(DEVLIST_KEY, "");
+    if (blob.length() == 0) return 0;
+
+    int added = 0;
+    int pos = 0;
+    // Group data for slot 0 and every added slot, applied after all rooms exist so
+    // member counts can be rebuilt from what is actually present.
+    while (pos < (int)blob.length() && deviceCount < MAX_SONOS_DEVICES) {
+        int eol = blob.indexOf('\n', pos);
+        if (eol < 0) eol = blob.length();
+        String line = blob.substring(pos, eol);
+        pos = eol + 1;
+
+        String f[7];
+        int n = 0, start = 0;
+        for (int i = 0; i <= (int)line.length() && n < 7; i++) {
+            if (i == (int)line.length() || line[i] == '|') { f[n++] = line.substring(start, i); start = i + 1; }
+        }
+        if (n < 4 || f[1].length() == 0) continue;
+
+        IPAddress ip;
+        if (!ip.fromString(f[0])) continue;
+
+        // Slot 0 is the verified, selected speaker: keep its fresh data, just take
+        // the remembered group.
+        bool isSelected = uuidEquals(devices[0].rinconID, f[1]) || devices[0].ip == ip;
+        SonosDevice* d = nullptr;
+        if (isSelected) {
+            d = &devices[0];
+        } else {
+            bool dup = false;
+            for (int i = 0; i < deviceCount; i++) if (uuidEquals(devices[i].rinconID, f[1])) { dup = true; break; }
+            if (dup) continue;
+            d = &devices[deviceCount];
+            resetDeviceSlot(*d, ip, decodeHTML(f[2]), f[1]);
+            sonos_sync::parseLineInField(f[3].length() == 1 ? f[3][0] : '?',
+                                         d->lineInKnown, d->hasLineIn);
+            if (n >= 5 && f[4].length()) { IPAddress p; if (p.fromString(f[4])) d->pairIP = p; }
+            deviceCount++;
+            added++;
+        }
+        if (n >= 6 && f[5].length()) {
+            d->groupCoordinatorUUID = f[5];
+            d->isGroupCoordinator = uuidEquals(f[5], d->rinconID);
+        }
+        if (n >= 7 && f[6].length()) d->groupMemberCount = max(1, (int)f[6].toInt());
+    }
+    Serial.printf("[SONOS] Restored %d remembered speaker(s) and their groups from NVS\n", added);
+    return added;
+}
+
+bool SonosController::selectLastSelection() {
+    if (!devices || deviceCount <= 0) return false;
+    if (getCurrentDevice()) return true;
+    // Not while a scan is rewriting the list: the index found below would not
+    // survive it. The next daily check or refresh tries again.
+    if (!tryBeginScan()) return false;
+    struct ScanSlot { SonosController* c; ~ScanSlot() { c->endScan(); } } slot{this};
+    if (deviceCount <= 0) return false;
+
+    const String rin = prefs.getString("cached_rincon", "");
+    const String ip  = prefs.getString("cached_ip", "");
+    int idx = -1;
+    for (int i = 0; i < deviceCount && idx < 0; i++) {
+        if (rin.length() > 0 && uuidEquals(devices[i].rinconID, rin)) idx = i;
+        else if (ip.length() > 0 && devices[i].ip.toString() == ip) idx = i;
+    }
+    if (idx < 0) {
+        idx = 0;   // the last choice is gone from the system: a room beats no room
+        Serial.println("[SONOS] Last selection not found - defaulting to the first speaker");
+    } else {
+        Serial.printf("[SONOS] Restored last selection: '%s'\n", devices[idx].roomName.c_str());
+    }
+    selectDevice(idx);
+    return true;
+}
+
+// ----------------------------------------------------------------------------
+// One scan at a time
+// ----------------------------------------------------------------------------
+// The Scan button (mainAppTask), the deferred bring-up and the sync task can all
+// rewrite devices[]. A plain `if (discovering) ...; discovering = true;` leaves a
+// window in which two of them both get in, so the test and the set are one
+// critical section.
+static portMUX_TYPE s_scan_mux = portMUX_INITIALIZER_UNLOCKED;
+
+bool SonosController::tryBeginScan() {
+    bool ok = false;
+    portENTER_CRITICAL(&s_scan_mux);
+    if (!discovering) { discovering = true; ok = true; }
+    portEXIT_CRITICAL(&s_scan_mux);
+    return ok;
+}
+
+void SonosController::endScan() {
+    portENTER_CRITICAL(&s_scan_mux);
+    discovering = false;
+    portEXIT_CRITICAL(&s_scan_mux);
+}
+
+// ----------------------------------------------------------------------------
+// refreshSpeakersFromTopology - keep the list in step with the system, quietly.
+// One GetZoneGroupState call names every room, its address and whether the Sonos
+// app would show it, which is everything a scan finds and without 15 seconds of
+// SSDP. That is what makes it fit to run in the background during playback.
+// ----------------------------------------------------------------------------
+int SonosController::refreshSpeakersFromTopology() {
+    if (!devices || deviceCount <= 0) return -1;
+    if (!tryBeginScan()) return -1;
+
+    // The selected speaker first (it is the one known to be awake), then up to two
+    // others: one switched-off speaker must not send us to SSDP.
+    int order[3];
+    int tries = 0;
+    const int cur = currentDeviceIndex;
+    if (cur >= 0 && cur < deviceCount) order[tries++] = cur;
+    for (int i = 0; i < deviceCount && tries < 3; i++) if (i != cur) order[tries++] = i;
+
+    int result = -1;
+    for (int t = 0; t < tries && result < 0; t++) {
+        String resp = sendSOAP(&devices[order[t]], "ZoneGroupTopology", "GetZoneGroupState", "");
+        if (resp.length() == 0) {
+            Serial.printf("[SYNC] %s did not answer GetZoneGroupState\n",
+                          devices[order[t]].ip.toString().c_str());
+            continue;
+        }
+        result = applySpeakerTopology(resp);
+    }
+    endScan();
+    return result;
+}
+
+int SonosController::refreshSpeakersViaProbe() {
+    if (!devices) return -1;
+    if (!tryBeginScan()) return -1;
+
+    IPAddress found[3];
+    const int nf = ssdpProbe(found, 3, SSDP_PROBE_LISTEN_MS);
+    int result = -1;
+    for (int f = 0; f < nf && result < 0; f++) {
+        // sendSOAP() addresses a SonosDevice. A known speaker at that address is
+        // used as is; otherwise the first unused slot (beyond deviceCount, so no
+        // other task looks at it) carries the address for this one request.
+        SonosDevice* target = nullptr;
+        for (int i = 0; i < deviceCount; i++) if (devices[i].ip == found[f]) { target = &devices[i]; break; }
+        if (!target && deviceCount < MAX_SONOS_DEVICES) {
+            target = &devices[deviceCount];
+            target->ip = found[f];
+            target->errorCount = 0;
+            target->connected = false;
+        }
+        if (!target) continue;
+        String resp = sendSOAP(target, "ZoneGroupTopology", "GetZoneGroupState", "");
+        if (resp.length() > 0) result = applySpeakerTopology(resp);
+    }
+    endScan();
+    if (nf == 0) Serial.println("[SYNC] SSDP probe: no speaker answered");
+    return result;
+}
+
+// Same M-SEARCH as discoverDevices(), but two bursts instead of five, a listen
+// window of a few seconds instead of 15, it stops at maxOut responders, and it
+// writes only to `out`. Caller holds the scan slot (the udp socket is shared).
+int SonosController::ssdpProbe(IPAddress* out, int maxOut, uint32_t listenMs) {
+    if (!out || maxOut <= 0) return 0;
+    udp.stop();
+    vTaskDelay(pdMS_TO_TICKS(50));
+    if (!udp.begin(1900)) {
+        Serial.println("[SYNC] SSDP probe: UDP begin failed");
+        return 0;
+    }
+    static const char msg[] =
+        "M-SEARCH * HTTP/1.1\r\n"
+        "HOST: 239.255.255.250:1900\r\n"
+        "MAN: \"ssdp:discover\"\r\n"
+        "MX: 1\r\n"
+        "ST: urn:schemas-upnp-org:device:ZonePlayer:1\r\n\r\n";
+    const IPAddress multicast(239, 255, 255, 250);
+    const IPAddress broadcast(255, 255, 255, 255);
+    for (int burst = 0; burst < 2; burst++) {
+        const bool locked = network_mutex &&
+            xSemaphoreTake(network_mutex, pdMS_TO_TICKS(NETWORK_MUTEX_TIMEOUT_MS)) == pdTRUE;
+        udp.beginPacket(multicast, 1900);
+        udp.write((const uint8_t*)msg, sizeof(msg) - 1);
+        udp.endPacket();
+        udp.beginPacket(broadcast, 1900);
+        udp.write((const uint8_t*)msg, sizeof(msg) - 1);
+        udp.endPacket();
+        if (locked) {
+            last_network_end_ms = millis();
+            xSemaphoreGive(network_mutex);
+        }
+        if (burst == 0) vTaskDelay(pdMS_TO_TICKS(500));
+    }
+
+    int n = 0;
+    const uint32_t start = millis();
+    char buf[513];
+    while (n < maxOut && (uint32_t)(millis() - start) < listenMs) {
+        const int size = udp.parsePacket();
+        if (size > 0) {
+            const int len = udp.read(buf, sizeof(buf) - 1);
+            if (len > 0) {
+                buf[len] = 0;
+                for (int i = 0; i < len; i++) if (buf[i] >= 'A' && buf[i] <= 'Z') buf[i] += 32;
+                if (strstr(buf, "sonos") || strstr(buf, "zoneplayer")) {
+                    const IPAddress ip = udp.remoteIP();
+                    bool dup = false;
+                    for (int k = 0; k < n; k++) if (out[k] == ip) { dup = true; break; }
+                    if (!dup) out[n++] = ip;
+                }
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    udp.stop();
+    Serial.printf("[SYNC] SSDP probe: %d responder(s)\n", n);
+    return n;
+}
+
+int SonosController::applySpeakerTopology(String& resp) {
+    // Case kept: these are room names. Entities are decoded once, which turns the
+    // SOAP-escaped inner XML back into markup; names still carry their own &apos;.
+    const size_t len = sonos_topology::decodeEntitiesInPlace(&resp[0], resp.length(), false);
+
+    // Static, not stack (~1.8 KB). Only ever used by the holder of the scan slot.
+    static sonos_topology::Member s_mem[MAX_SONOS_DEVICES * 2];
+    const int n = sonos_topology::parseMembers(resp.c_str(), len, s_mem, MAX_SONOS_DEVICES * 2);
+    int visible = 0;
+    for (int i = 0; i < n; i++) if (!s_mem[i].hidden) visible++;
+    if (visible == 0) {
+        Serial.println("[SYNC] Topology listed no rooms - keeping the current list");
+        return -1;
+    }
+
+    int added = 0, removed = 0, renamed = 0, moved = 0;
+    if (xSemaphoreTake(deviceMutex, pdMS_TO_TICKS(500)) != pdTRUE) return -1;
+
+    // Rooms that are in the system: update in place, or add. New slots are filled
+    // before deviceCount is raised, so a reader never sees a half-written one.
+    for (int m = 0; m < n; m++) {
+        if (s_mem[m].hidden) continue;
+        char host[20];
+        IPAddress ip;
+        const bool haveIp = sonos_topology::locationHost(s_mem[m].location, host, sizeof(host)) &&
+                            ip.fromString(host);
+        char ubuf[64];
+        const size_t ul = s_mem[m].uuid.len < sizeof(ubuf) - 1 ? s_mem[m].uuid.len : sizeof(ubuf) - 1;
+        memcpy(ubuf, s_mem[m].uuid.ptr, ul);
+        ubuf[ul] = '\0';
+        const String uuid(ubuf);
+        const String name = s_mem[m].name.ptr
+            ? decodeHTML(String(s_mem[m].name.ptr, s_mem[m].name.len)) : String();
+
+        int found = -1;
+        for (int i = 0; i < deviceCount; i++) if (uuidEquals(devices[i].rinconID, uuid)) { found = i; break; }
+        if (found >= 0) {
+            if (haveIp && !(devices[found].ip == ip)) { devices[found].ip = ip; devices[found].errorCount = 0; moved++; }
+            if (name.length() && devices[found].roomName != name) { devices[found].roomName = name; renamed++; }
+        } else if (deviceCount < MAX_SONOS_DEVICES && haveIp) {
+            resetDeviceSlot(devices[deviceCount], ip, name.length() ? name : ip.toString(), uuid);
+            deviceCount++;
+            added++;
+        }
+    }
+
+    // Rooms that left the system, or are now a bonded Sub / surround / pair half
+    // (issue #211 on a list remembered from before the fix). The selected room is
+    // never removed here: a speaker that is merely switched off drops out of the
+    // topology, and the panel keeps showing it as "not connected" rather than
+    // swapping the room under the user. Entries without a RINCON are left alone.
+    //
+    // Removal shifts later slots down. The UI screens address rooms by index and
+    // repaint on the UPDATE_GROUPS sent below; this only runs after SYNC_IDLE_MS
+    // without a touch, so a tap on a stale row is not a practical race.
+    for (int i = deviceCount - 1; i >= 0; i--) {
+        if (i == currentDeviceIndex) continue;
+        if (devices[i].rinconID.length() == 0) continue;
+        bool visibleNow = false;
+        for (int m = 0; m < n && !visibleNow; m++)
+            visibleNow = !s_mem[m].hidden &&
+                sonos_topology::uuidEquals(devices[i].rinconID.c_str(), devices[i].rinconID.length(),
+                                           s_mem[m].uuid.ptr, s_mem[m].uuid.len);
+        if (visibleNow) continue;
+        Serial.printf("[SYNC]   '%s' is no longer a room of its own - removed\n",
+                      devices[i].roomName.c_str());
+        for (int k = i; k < deviceCount - 1; k++) devices[k] = devices[k + 1];
+        deviceCount--;
+        if (currentDeviceIndex > i) currentDeviceIndex--;
+        removed++;
+    }
+    xSemaphoreGive(deviceMutex);
+
+    // Groups from the same payload: lowercase it (the group parser matches tag
+    // names in lowercase and RINCONs case-blind) instead of a second SOAP. Room
+    // names were copied out above, so their case no longer matters here.
+    char* p = &resp[0];
+    for (size_t i = 0; i < len; i++) if (p[i] >= 'A' && p[i] <= 'Z') p[i] += 32;
+    applyGroupTopology(p, len);
+
+    // Capabilities (line-in) come from the device description. Asked for every
+    // room whose flag is not known yet: the rooms just added, and any whose
+    // earlier fetch failed (remembered as '?' in the blob). Retried like
+    // discoverDevices() does, because a busy network_mutex is the normal state
+    // during playback. A room still unanswered stays unknown and is asked again on
+    // the next refresh; the default false is never persisted as a result. Only
+    // rooms present in this topology are asked, so a switched-off selected room
+    // costs nothing. The scan slot (held by the caller) keeps the slots in place.
+    for (int i = 0; i < deviceCount; i++) {
+        if (devices[i].lineInKnown || devices[i].rinconID.length() == 0) continue;
+        bool present = false;
+        for (int m = 0; m < n && !present; m++)
+            present = !s_mem[m].hidden &&
+                sonos_topology::uuidEquals(devices[i].rinconID.c_str(), devices[i].rinconID.length(),
+                                           s_mem[m].uuid.ptr, s_mem[m].uuid.len);
+        if (!present) continue;
+        bool ok = getRoomName(&devices[i]);
+        for (int attempt = 1; !ok && attempt <= DISCOVERY_ROOMNAME_RETRIES; attempt++) {
+            vTaskDelay(pdMS_TO_TICKS(DISCOVERY_ROOMNAME_RETRY_MS));
+            ok = getRoomName(&devices[i]);
+        }
+        if (!ok)
+            Serial.printf("[SYNC]   Line-in of '%s' still unknown - asking again next refresh\n",
+                          devices[i].roomName.c_str());
+    }
+
+    cacheDeviceList();
+    Serial.printf("[SYNC] Speakers refreshed: %d room(s) (+%d new, -%d gone, %d renamed, %d moved)\n",
+                  deviceCount, added, removed, renamed, moved);
+    return deviceCount;
 }

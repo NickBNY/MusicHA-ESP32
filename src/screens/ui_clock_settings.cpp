@@ -307,7 +307,7 @@ void createClockSettingsScreen() {
         lv_obj_t* card = addCard(content, "Display");
 
         lv_obj_t* slot_mode = addSettingRow(card, "Activate clock",
-            "When the panel should fall back to a clock face", true);
+            "When to fall back to a clock face. Never while music plays", true);
         // Shorter labels. "After inactivity (nothing playing)" is 34 characters and
         // did not fit 206px, so the closed dropdown drew its text straight over
         // the chevron. The bracketed qualifier is what matters; "After
@@ -609,12 +609,16 @@ void createClockSettingsScreen() {
 
         // ── Temperature unit ────────────────────────────────────────────────
         lv_obj_t* slot_unit = addSettingRow(card, "Temperature unit",
-                                            "On = Fahrenheit (°F), Off = Celsius (°C)", false);
+                                            "On = Imperial (°F, mph), Off = Metric (°C, km/h)", false);
         lv_obj_t* sw_fahr = addSwitch(slot_unit, clock_wx_fahrenheit);
         lv_obj_add_event_cb(sw_fahr, [](lv_event_t* e) {
             lv_obj_t* sw = (lv_obj_t*)lv_event_get_target(e);
             clock_wx_fahrenheit = lv_obj_has_state(sw, LV_STATE_CHECKED);
             wifiPrefs.putBool(NVS_KEY_CLOCK_WEATHER_FAHR, clock_wx_fahrenheit);
+            // Cached values are in the old unit. Invalidate them so no face or the
+            // shelf clock shows e.g. a km/h number labelled mph, and so
+            // clockRequestWeatherRefresh() is not held off by its 15-min cadence.
+            clock_wx_valid = false;
             clock_weather_needs_refetch = true;
         }, LV_EVENT_VALUE_CHANGED, NULL);
     }

@@ -228,7 +228,9 @@ jobs:
       run: |
         DIST=docs/.vitepress/dist
         missing=0
-        for f in manifest-4inch.json manifest-7inch.json firmware-4inch.bin firmware-7inch.bin bootloader.bin partitions.bin boot_app0.bin; do
+        # The rev3 set (#203) is listed too: its installer button 404s just as
+        # silently as the others if one of these goes missing.
+        for f in manifest-4inch.json manifest-4inch-r3.json manifest-7inch.json firmware-4inch.bin firmware-4inch-r3.bin firmware-7inch.bin bootloader.bin bootloader-r3.bin partitions.bin boot_app0.bin; do
           if [ -s "$DIST/$f" ]; then
             echo "ok       $f"
           else

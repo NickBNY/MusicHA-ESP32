@@ -22,11 +22,19 @@
 #include "ui_fonts.h"
 #include "screenshot.h"
 #include "analytics.h"
+#include "sonos_sync.h"
+#include "sonos_sync_logic.h"
+#include "esphome_api.h"
+#include "favorites.h"
 #if SCREEN_SIZE == 7
 #include "../lib/jd9165_lcd/jd9165_panels.h"
 #endif
 
 static volatile bool sonos_started = false;  // true once Sonos tasks are running (written by deferred task, read by mainAppTask)
+// Back-off between failed bring-up attempts. Written by deferredDiscoveryTask
+// before it clears deferred_discovery_running, read by mainAppTask only after.
+static volatile uint32_t deferred_next_try_ms = 0;
+static volatile uint8_t  deferred_failures = 0;   // 0 = no back-off pending
 static volatile bool deferred_discovery_running = false;  // guards the one-shot deferred discovery task (issue #69)
 static TaskHandle_t mainAppTaskHandle = nullptr;
 static void mainAppTask(void* param);            // forward declaration — defined after loop()
@@ -247,7 +255,7 @@ void setup() {
     logResetReason();
     rebootLogBoot();   // why the last run ended - see reboot_log.h
     beginOtaTrial();
-    Serial.printf("Free heap: %d, PSRAM: %d\n", esp_get_free_heap_size(), heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    Serial.printf("Free heap: %d, PSRAM: %d\n", (int)esp_get_free_heap_size(), heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
     // Detect flash chip - auto-suspend only works with specific chips
     uint32_t flash_id = 0;
@@ -272,7 +280,7 @@ void setup() {
         // Check if flash supports auto-suspend (ESP-IDF: GD25QxxE, XM25QxxC, FM25Q32)
         bool suspend_ok = (mfg_id == 0xC8 || mfg_id == 0x20 || mfg_id == 0xA1);
         Serial.printf("[FLASH] %s %dMB (0x%06X) - Auto-suspend: %s\n",
-                      mfg_name, flash_size_mb, flash_id, suspend_ok ? "YES" : "NO");
+                      mfg_name, flash_size_mb, (unsigned)flash_id, suspend_ok ? "YES" : "NO");
     }
 
     // Silicon revision, and which revision THIS image was built for (#203).
@@ -329,6 +337,7 @@ void setup() {
     night_level        = wifiPrefs.getInt(NVS_KEY_NIGHT_LEVEL,  BRIGHTNESS_DIM_MIN);
     night_touch_level  = wifiPrefs.getInt(NVS_KEY_NIGHT_TOUCH,  DEFAULT_NIGHT_TOUCH);
     lyrics_enabled = wifiPrefs.getBool(NVS_KEY_LYRICS, true);
+    auto_update_enabled = wifiPrefs.getBool(NVS_KEY_AUTO_UPDATE, true);
     amber_shelf_clock = wifiPrefs.getBool(NVS_KEY_SHELF_CLOCK, false);
     analytics_enabled = wifiPrefs.getBool(NVS_KEY_ANALYTICS, ANALYTICS_ENABLED);
     blur_bg_enabled = wifiPrefs.getBool(NVS_KEY_BLUR_BG, true);   // #49, defaults on
@@ -487,7 +496,7 @@ void setup() {
         // art is decoded at ART_PX -- 420 on the 4", 525 on the 7" -- so the true
         // figure was three to four times larger.
         Serial.printf("  Art LRU cache:   ~%uKB (2 slots x %ux%ux2)\n",
-                      2*ART_PX*ART_PX*2/1024, ART_PX, ART_PX);
+                      (unsigned)(2*ART_PX*ART_PX*2/1024), (unsigned)ART_PX, (unsigned)ART_PX);
         Serial.printf("  Art task stack:    %uKB\n", ART_TASK_STACK_SIZE/1024);
         Serial.printf("  Art download buf:  %uKB max (alloc+free per download)\n",
                       ART_MAX_DOWNLOAD_SIZE/1024);
@@ -661,6 +670,11 @@ void setup() {
         // Restart to return to normal operation; NVS_KEY_OTA_PENDING is already false.
         rebootNoteCause(reboot_log::CAUSE_OTA_FAILED);
         vTaskDelay(pdMS_TO_TICKS(5000));  // let user read the error message
+        // Backlight off before every restart in this file: between the reset and
+        // the boot screen's first paint the LCD controller shows its power-on
+        // state, a flat blue field (ui_general_screen.cpp:286-291).
+        display_set_brightness(0);
+        vTaskDelay(pdMS_TO_TICKS(100));
         ESP.restart();
     }
 
@@ -690,9 +704,10 @@ void setup() {
             sonos.startTasks();
             sonos_started = true;
         } else {
-            // Cache miss or unreachable - skip SSDP at boot (device may not be ready yet)
-            // User can trigger discovery manually via Settings > Scan
-            Serial.println("[SONOS] Cached device unreachable at boot - use Settings to scan");
+            // Cache miss or unreachable - skip SSDP during boot (the speaker may not be
+            // ready yet). deferredDiscoveryTask picks this up once the UI is running
+            // and scans in the background, with a back-off between attempts.
+            Serial.println("[SONOS] Cached device unreachable at boot - will scan in the background");
         }
     }
 
@@ -744,6 +759,10 @@ static unsigned long lastWifiCheck = 0;
 void checkWiFiReconnect() {
     if (millis() - lastWifiCheck < WIFI_CHECK_INTERVAL_MS) return;
     lastWifiCheck = millis();
+    // A user Wi-Fi scan or connect is in flight (ui_handlers.cpp). They used to
+    // block this task, so a background WiFi.reconnect() could never race them;
+    // now that they run without blocking, keep it that way by standing aside.
+    if (wifi_user_op_in_progress) return;
 
     if (WiFi.status() != WL_CONNECTED) {
         Serial.println("[WIFI] Connection lost, attempting reconnect...");
@@ -763,15 +782,25 @@ void checkWiFiReconnect() {
         Serial.println("[WIFI] Pending credentials persisted after async connect (issue #85)");
     }
 
-    if (!sonos_started && !deferred_discovery_running) {
+    if (!sonos_started && !deferred_discovery_running &&
+        (deferred_failures == 0 || sonos_sync::due(millis(), deferred_next_try_ms))) {
         // WiFi connected but Sonos not yet started (WiFi was down at boot).
         // tryLoadCachedDevice() does a blocking HTTP reachability GET (up to 5s). Running it
         // here — on mainAppTask, the same thread as lv_timer_handler() — froze LVGL and blocked
         // touch for the full timeout (issue #69). Hand it to a one-shot background task so the
-        // UI thread stays responsive. The 10s lastWifiCheck throttle + the guard flag ensure
-        // only one task is ever in flight; it retries on the next tick if discovery fails.
+        // UI thread stays responsive. The guard flag ensures only one task is ever in
+        // flight. A failed attempt sets a back-off (30 s doubling to 10 min) instead of
+        // retrying on every 10 s tick, which was the retry storm in the #200/#208 logs.
         deferred_discovery_running = true;
-        xTaskCreatePinnedToCore(deferredDiscoveryTask, "DefDisc", 8192, NULL, 1, NULL, 1);
+        if (xTaskCreatePinnedToCore(deferredDiscoveryTask, "DefDisc", 8192, NULL, 1, NULL, 1) != pdPASS) {
+            // No internal block for the stack: back off like a failed attempt
+            // instead of leaving the guard set (which would block bring-up for good).
+            deferred_discovery_running = false;
+            if (deferred_failures < 16) deferred_failures = deferred_failures + 1;
+            deferred_next_try_ms = millis() + sonos_sync::backoffMs(
+                deferred_failures, DEFERRED_BACKOFF_BASE_MS, SPEAKER_ZERO_RETRY_MS);
+            Serial.println("[SONOS] Could not start deferred discovery - backing off");
+        }
     }
 }
 
@@ -780,19 +809,53 @@ void checkWiFiReconnect() {
 // startTasks() may touch flash, both of which assert if the calling stack is in PSRAM.
 // Self-deletes when done; deferred_discovery_running gates re-entry.
 static void deferredDiscoveryTask(void* /*param*/) {
-    // (Re)start NTP sync now that we have connectivity
-    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
-    setenv("TZ", CLOCK_ZONES[clock_tz_idx].posix, 1);
-    tzset();
+    // (Re)start NTP sync now that we have connectivity. Once: a retry after a
+    // failed bring-up has nothing to gain from restarting SNTP.
+    static bool ntp_started = false;
+    if (!ntp_started) {
+        ntp_started = true;
+        configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+        setenv("TZ", CLOCK_ZONES[clock_tz_idx].posix, 1);
+        tzset();
+    }
     Serial.println("[SONOS] WiFi now connected - attempting deferred discovery from cache");
     bool loadedFromCache = sonos.tryLoadCachedDevice();
+    bool up = false;
     if (loadedFromCache) {
         sonos.selectDevice(0);
         sonos.startTasks();
         sonos_started = true;
+        up = true;
         Serial.println("[SONOS] Deferred discovery succeeded from cache");
     } else {
-        Serial.println("[SONOS] No cached device - use Devices screen to discover");
+        // The remembered speaker did not answer (asleep, moved, or never cached).
+        // Scan for the system in the background instead of waiting for someone to
+        // press Scan. Background mode keeps LVGL and the watchdog out of it.
+        Serial.println("[SONOS] Cached speaker unavailable - scanning in the background");
+        if (sonos.discoverDevices(true) > 0) {
+            sonos.selectLastSelection();
+            sonos.startTasks();
+            sonos_started = true;
+            up = true;
+            Serial.println("[SONOS] Background scan found the system");
+        }
+    }
+    // Back off between failures. The bring-up used to retry its HTTP probe every
+    // 10 s; with a speaker that is simply switched off that is a steady stream of
+    // traffic over the SDIO link, the load the crash defences exist to keep down
+    // (#200, #208). Each failed attempt now also runs a background SSDP scan, so
+    // the first two retries (30 s, 1 min) carry more traffic than the old probe;
+    // from about 8 min after the first failure the average falls below the old
+    // rate, and it settles at one attempt per 10 min.
+    if (up) {
+        deferred_failures = 0;
+    } else {
+        if (deferred_failures < 16) deferred_failures = deferred_failures + 1;
+        // 30 s, 1, 2, 4, 8 min, then every 10 min (sonos_sync_logic.h, host-tested)
+        const uint32_t wait = sonos_sync::backoffMs(deferred_failures, DEFERRED_BACKOFF_BASE_MS,
+                                                    SPEAKER_ZERO_RETRY_MS);
+        deferred_next_try_ms = millis() + wait;
+        Serial.printf("[SONOS] No speakers yet - next attempt in %lus\n", (unsigned long)(wait / 1000));
     }
     deferred_discovery_running = false;
     vTaskDelete(NULL);
@@ -847,11 +910,33 @@ void logHeapStatus() {
     }
 }
 
+// Offset from millis() to LVGL's clock, fixed when mainAppTask installs the tick
+// callback (see there).
+static uint32_t s_tick_off;
+
 // Main application task — runs all LVGL and UI logic with a 16KB internal SRAM stack.
 // The Arduino loopTask (fixed 8KB) becomes idle below; it was regularly hitting
 // only ~976 bytes free, causing Store access fault crashes via LVGL buffer corruption.
 static void mainAppTask(void* param) {
     esp_task_wdt_add(NULL);  // Register this task with watchdog (not loopTask)
+
+    // LVGL's clock is the real clock from here on. It used to advance by a fixed
+    // 3 ms per loop pass, which both ran slow (the pass itself takes time) and tied
+    // the loop to a 3 ms cadence. With a real tick the loop can sleep for as long as
+    // LVGL says nothing is due, which is the pattern the LVGL docs prescribe and is
+    // what lets an idle panel stop spinning 330 times a second.
+    //
+    // LV_TICK_CUSTOM in lv_conf.h does nothing in LVGL 9.6 (nothing under
+    // lvgl/src reads it), so until this line the clock is whatever setup() and
+    // ui_boot_screen.cpp fed lv_tick_inc() by hand. Once a callback is set,
+    // lv_tick_get() returns the callback and lv_tick_inc() becomes harmless.
+    // Returning bare millis() would jump the clock forward by every boot second
+    // the hand-fed ticks missed, so timers and animations created in setup()
+    // would all fire or finish at once. s_tick_off keeps lv_tick_get() continuous
+    // across the switch.
+    s_tick_off = lv_tick_get() - millis();
+    lv_tick_set_cb([]() -> uint32_t { return millis() + s_tick_off; });
+    uint32_t idle_wait_ms = 3;
 
     for (;;) {
         esp_task_wdt_reset();
@@ -874,7 +959,6 @@ static void mainAppTask(void* param) {
         // "A newer version is available" toast. No-op until its interval is due,
         // and the check itself is gated on WiFi, DMA and the radio being idle.
         otaBackgroundCheckTick();
-        lv_tick_inc(3);
 
         // Skip LVGL timer during OTA to prevent PSRAM access during flash writes
         bool skip_updates = false;
@@ -888,11 +972,14 @@ static void mainAppTask(void* param) {
             // must not touch LVGL's animation list while we walk it here.
             if (touch_take_wake_request()) resetScreenTimeout();
 
-            lv_timer_handler();
+            idle_wait_ms = lv_timer_handler();   // ms until LVGL next has work
             processUpdates();
             checkAutoDim();
             checkClockTrigger();
             checkWiFiReconnect();
+            sonosSyncTick();   // speaker/group refresh, daily selection + memory check
+            haTick();          // Home Assistant (ESPHome API); one flag read while off
+            favoritesTick();   // Favorites row data, last-source write
             logHeapStatus();  // Periodic memory monitoring
             screenshotPoll();  // serial "screenshot" command — no-op otherwise
 
@@ -990,6 +1077,8 @@ static void mainAppTask(void* param) {
                                 rebootNoteCause(reboot_log::CAUSE_DMA_RECONNECT);
                                 esp_task_wdt_reset();
                                 vTaskDelay(pdMS_TO_TICKS(1000));
+                                display_set_brightness(0);
+                                vTaskDelay(pdMS_TO_TICKS(100));
                                 esp_restart();
                             }
                         }
@@ -1012,6 +1101,8 @@ static void mainAppTask(void* param) {
                         rebootNoteCause(reboot_log::CAUSE_WIFI_TIMEOUT);
                         esp_task_wdt_reset();
                         vTaskDelay(pdMS_TO_TICKS(1000));
+                        display_set_brightness(0);
+                        vTaskDelay(pdMS_TO_TICKS(100));
                         esp_restart();
                     }
                 } else {
@@ -1021,13 +1112,21 @@ static void mainAppTask(void* param) {
                     rebootNoteCause(reboot_log::CAUSE_DMA_WIFI_STOP);
                     esp_task_wdt_reset();
                     vTaskDelay(pdMS_TO_TICKS(1000));
+                    display_set_brightness(0);
+                    vTaskDelay(pdMS_TO_TICKS(100));
                     esp_restart();
                 }
             }
             // ────────────────────────────────────────────────────────────────────
         }
 
-        vTaskDelay(pdMS_TO_TICKS(3));
+        // Sleep until LVGL's next timer is due, but never more than one frame: touch
+        // wake requests, the sync tick and the OTA/clock state machines are polled
+        // once per pass and 16 ms is already below what anyone can perceive. The 2 ms
+        // floor keeps a runaway timer from starving the network tasks.
+        if (idle_wait_ms < 2)  idle_wait_ms = 2;
+        if (idle_wait_ms > 16) idle_wait_ms = 16;
+        vTaskDelay(pdMS_TO_TICKS(idle_wait_ms));
     }
 }
 

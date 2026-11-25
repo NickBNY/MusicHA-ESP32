@@ -88,7 +88,7 @@ python scripts/bump_version.py nightly
 - Appends `-nightly.COMMITHASH` (e.g., `1.1.6-nightly.abc1234`)
 - Updates all version files:
   - `version.json`
-  - `web-installer/manifest-4inch.json` and `web-installer/manifest-7inch.json`
+  - `web-installer/manifest-4inch.json`, `web-installer/manifest-4inch-r3.json` and `web-installer/manifest-7inch.json`
   - `include/ui_common.h`
 
 **Output:**
@@ -516,11 +516,12 @@ gh release view vX.Y.Z                   # View specific release
 ```
 SonosESP/
 ├── version.json                          # Version source of truth
-├── bump_version.py                       # Version bump script (updates both manifests)
+├── bump_version.py                       # Version bump script (updates all three manifests)
 ├── create_nightly.py                     # Nightly release trigger
-├── platformio.ini                        # esp32_4inch + esp32_7inch envs
+├── platformio.ini                        # esp32_4inch + esp32_4inch_r3 + esp32_7inch envs
 ├── web-installer/
 │   ├── manifest-4inch.json               # 4" installer manifest (canonical)
+│   ├── manifest-4inch-r3.json            # 4" on ESP32-P4 rev 3.x (#203)
 │   ├── manifest-7inch.json               # 7" installer manifest (BETA)
 ├── include/
 │   └── ui_common.h                       # Firmware version constant

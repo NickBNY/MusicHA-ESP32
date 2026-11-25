@@ -7,11 +7,15 @@
 #include "reboot_log.h"
 #include "ui_icons.h"
 #include <vector>
+#include <new>
 #include "config.h"
+#include "auto_update.h"
 #include "ui_theme.h"
 #include "lyrics.h"
 #include "position_estimate.h"
 #include "clock_screen.h"
+#include "favorites.h"
+#include "amber.h"
 #include <esp_task_wdt.h>
 #include "ui_fonts.h"
 
@@ -131,9 +135,108 @@ static void playbackPositionReset(void) { s_pos.reset(); }
 // ============================================================================
 // Playback Event Handlers
 // ============================================================================
+// ── Play button feedback ─────────────────────────────────────────────────────
+// The button changes colour the moment it is pressed and keeps it until Sonos
+// itself reports the new state. The glyph is NOT swapped here: updateUI() flips
+// play/pause from the speaker's own transport state, so the icon only changes
+// once the speaker really is playing (or paused), never on a hope.
+static lv_timer_t* s_play_timer = nullptr;
+static lv_obj_t*   s_play_btn   = nullptr;     // the button the colour was applied to
+static bool        s_play_want  = false;       // state the press asked for
+static uint32_t    s_play_since = 0;
+
+// The pending colour lives in LV_STATE_USER_1, so ending it is a state change:
+// no saved colour to restore (a theme may repaint the default-state bg meanwhile),
+// and nothing to undo if a theme switch freed the button.
+static void playPendingEnd() {
+    if (s_play_timer) { lv_timer_delete(s_play_timer); s_play_timer = nullptr; }
+    // A theme switch deletes the old button; only touch it if it is still ours.
+    if (s_play_btn && s_play_btn == btn_play) lv_obj_remove_state(btn_play, LV_STATE_USER_1);
+    s_play_btn = nullptr;
+}
+
+static void playPendingTick(lv_timer_t*) {
+    SonosDevice* d = sonos.getCurrentDevice();
+    const bool playing = d && d->isPlaying;
+    if (s_play_btn != btn_play || playing == s_play_want ||
+        (uint32_t)(millis() - s_play_since) > 8000) {
+        playPendingEnd();
+    }
+}
+
+static void playPendingBegin(bool want_playing) {
+    if (!btn_play) return;
+    if (s_play_btn && s_play_btn != btn_play) playPendingEnd();   // stale (theme switch)
+    s_play_btn   = btn_play;
+    s_play_want  = want_playing;
+    s_play_since = millis();
+    // Green for "starting", muted for "stopping": both read as "heard you".
+    lv_obj_set_style_bg_color(btn_play, want_playing ? AMB_LIVE : AMB_TEXT3, LV_STATE_USER_1);
+    lv_obj_add_state(btn_play, LV_STATE_USER_1);
+    if (!s_play_timer) s_play_timer = lv_timer_create(playPendingTick, 150, nullptr);
+}
+
 void ev_play(lv_event_t* e) {
     SonosDevice* d = sonos.getCurrentDevice();
-    if (d) d->isPlaying ? sonos.pause() : sonos.play();
+    if (!d) return;
+
+    if (d->isPlaying) {
+        sonos.pause();
+        playPendingBegin(false);
+        return;
+    }
+
+    // Nothing to resume? Start the last source the user chose. "No source" means
+    // an idle speaker with no queue and no stream - what is left after a restart
+    // of the speaker, or after the queue was cleared - where plain Play does
+    // nothing and the button looks broken.
+    bool no_source = false;
+    if (xSemaphoreTake(sonos.getDeviceMutex(), pdMS_TO_TICKS(30)) == pdTRUE) {
+        no_source = d->currentTrack.length() == 0 && d->totalTracks == 0 &&
+                    !d->isRadioStation && !d->isLineIn && !d->isTvAudio;
+        xSemaphoreGive(sonos.getDeviceMutex());
+    }
+    if (no_source) {
+        if (lastSourceExists()) {
+            lastSourcePlay();
+            playPendingBegin(true);
+            return;
+        }
+        if (favoritesCount() > 0) {          // never chose one: the first favorite
+            favoritesPlay(0);
+            playPendingBegin(true);
+            return;
+        }
+    }
+    sonos.play();
+    playPendingBegin(true);
+}
+
+// "Lyrics on/off" under the artwork. Same setting and key as Settings > General,
+// including the interlock with the shelf clock (both want the same shelf).
+void ev_lyrics_toggle(lv_event_t* e) {
+    (void)e;
+    lyrics_enabled = !lyrics_enabled;
+    wifiPrefs.putBool(NVS_KEY_LYRICS, lyrics_enabled);
+    if (lyrics_enabled && amber_shelf_clock) {
+        amber_shelf_clock = false;
+        wifiPrefs.putBool(NVS_KEY_SHELF_CLOCK, false);
+    }
+    if (lyrics_enabled) {
+        lyrics_last_track = "";        // fetch for the track that is already playing
+    } else {
+        lyrics_abort_requested = true; // stop a fetch in flight
+        clearLyrics();
+    }
+    setLyricsVisible(lyrics_enabled && lyrics_ready);
+    updateLyricsStatus();
+}
+
+// Touching the album art while music plays opens the Favorites list.
+void ev_album_tap(lv_event_t* e) {
+    (void)e;
+    if (!ui_playing) return;
+    openFavoritesScreen();
 }
 
 void ev_prev(lv_event_t* e) {
@@ -152,8 +255,16 @@ void ev_shuffle(lv_event_t* e) {
 void ev_repeat(lv_event_t* e) {
     SonosDevice* d = sonos.getCurrentDevice();
     if (!d) return;
-    if (d->repeatMode == "NONE") sonos.setRepeat("ALL");
-    else if (d->repeatMode == "ALL") sonos.setRepeat("ONE");
+    // repeatMode is a String the polling task reassigns under deviceMutex
+    // (updateTrackInfo); reading it unlocked can see a freed buffer. Snapshot it
+    // like the no-source check in ev_play. On timeout skip the toggle: the user
+    // can tap again, a wrong mode is worse than a missed tap.
+    String mode;
+    if (xSemaphoreTake(sonos.getDeviceMutex(), pdMS_TO_TICKS(30)) != pdTRUE) return;
+    mode = d->repeatMode;
+    xSemaphoreGive(sonos.getDeviceMutex());
+    if (mode == "NONE") sonos.setRepeat("ALL");
+    else if (mode == "ALL") sonos.setRepeat("ONE");
     else sonos.setRepeat("NONE");
 }
 
@@ -245,40 +356,140 @@ void ev_back_settings(lv_event_t* e) {
     lv_screen_load(scr_settings);
 }
 
-void ev_groups(lv_event_t* e) {
+// Re-reading the topology is a SOAP call, and sendSOAP() can wait seconds for the
+// radio (network_mutex, then the SDIO cooldowns). Done inline it froze the panel
+// on the way to Groups from the player. The Settings rail loaded scr_groups
+// directly, without refreshing at all; it now calls ev_groups() too
+// (ui_sidebar.cpp). The refresh runs in
+// a short-lived task instead: the screen opens at once with what is already known,
+// and refreshGroupTopology()'s UPDATE_GROUPS notification repaints it (see
+// processUpdates()).
+static volatile bool s_groups_refreshing = false;
+
+static void groupsRefreshTask(void*) {
     sonos.updateGroupInfo();
+    s_groups_refreshing = false;
+    vTaskDelete(NULL);
+}
+
+void ev_groups(lv_event_t* e) {
     refreshGroupsList();
     lv_screen_load(scr_groups);
+    if (!s_groups_refreshing) {
+        s_groups_refreshing = true;
+        if (xTaskCreatePinnedToCore(groupsRefreshTask, "GrpRefresh", 8192, NULL, 1, NULL, 1) != pdPASS)
+            s_groups_refreshing = false;
+    }
+}
+
+// ============================================================================
+// Off-LVGL jobs
+// ============================================================================
+// Click handlers run inside lv_timer_handler() on mainAppTask, so anything that
+// waits on the network there (SSDP, SOAP, TLS, Wi-Fi RPCs over esp-hosted) freezes
+// touch and drawing until it returns. A job runs `work` on its own one-shot task
+// and then `done` back on the LVGL task through a 100 ms lv_timer, the same
+// task + volatile flag + barrier + poll shape as sourcesFetchTask/browsePoll
+// (ui_settings_screens.cpp). The task stack is internal SRAM
+// (xTaskCreatePinnedToCore), so work may write NVS.
+struct UiJob {
+    void (*work)(void*);
+    void (*done)(void*);
+    void* arg;
+    volatile bool finished;
+};
+
+static void uiJobTask(void* p) {
+    UiJob* job = (UiJob*)p;
+    job->work(job->arg);
+    if (job->done == nullptr) {
+        delete job;
+    } else {
+        __sync_synchronize();
+        job->finished = true;   // uiJobPoll owns the job from here: do not touch it
+    }
+    vTaskDelete(NULL);
+}
+
+static void uiJobPoll(lv_timer_t* t) {
+    UiJob* job = (UiJob*)lv_timer_get_user_data(t);
+    if (!job->finished) return;
+    __sync_synchronize();
+    lv_timer_delete(t);
+    void (*done)(void*) = job->done;
+    void* arg = job->arg;
+    delete job;
+    done(arg);
+}
+
+bool uiOffloadStart(const char* name, uint32_t stack, void (*work)(void*), void (*done)(void*), void* arg) {
+    if (!work) return false;
+    UiJob* job = new (std::nothrow) UiJob{work, done, arg, false};
+    if (!job) return false;
+    lv_timer_t* poll = nullptr;
+    if (done) {
+        // Timer first: once the task exists it may finish before we return.
+        poll = lv_timer_create(uiJobPoll, 100, job);
+        if (!poll) { delete job; return false; }
+    }
+    if (xTaskCreatePinnedToCore(uiJobTask, name, stack, job, 1, NULL, 1) != pdPASS) {
+        if (poll) lv_timer_delete(poll);
+        delete job;
+        return false;
+    }
+    return true;
+}
+
+// ============================================================================
+// Speaker scan (Speakers > Scan, Groups > Scan)
+// ============================================================================
+// discoverDevices(true) is the background mode: no LVGL, no WDT feed
+// (sonos_discovery.cpp). Stack 8192, the same as DefDisc, which runs this scan.
+static volatile bool s_scan_busy = false;
+
+struct ScanJob {
+    bool with_groups;
+    int count;
+    void (*done)(int);
+};
+
+static void speakerScanWork(void* p) {
+    ScanJob* job = (ScanJob*)p;
+    // Same 25 s limit discoverDevices() itself uses for a scan already running.
+    for (int waited = 0; sonos.isDiscovering() && waited < 25000; waited += 100)
+        vTaskDelay(pdMS_TO_TICKS(100));
+    job->count = sonos.discoverDevices(true);
+    if (job->with_groups) sonos.updateGroupInfo();
+}
+
+static void speakerScanDone(void* p) {
+    ScanJob* job = (ScanJob*)p;
+    int count = job->count;
+    void (*done)(int) = job->done;
+    delete job;
+    s_scan_busy = false;
+    if (done) done(count);
+}
+
+bool speakerScanBusy() { return s_scan_busy; }
+
+bool speakerScanStart(bool with_groups, void (*done)(int count)) {
+    if (s_scan_busy) return false;
+    ScanJob* job = new (std::nothrow) ScanJob{with_groups, -1, done};
+    if (!job) return false;
+    s_scan_busy = true;
+    if (!uiOffloadStart("SpkScan", 8192, speakerScanWork, speakerScanDone, job)) {
+        delete job;
+        s_scan_busy = false;
+        return false;
+    }
+    return true;
 }
 
 // ============================================================================
 // Speaker Discovery Event Handler
 // ============================================================================
-void ev_discover(lv_event_t* e) {
-    Serial.println("[SCAN] Scan button pressed");
-
-    // Disable scan button during discovery
-    if (btn_sonos_scan) {
-        lv_obj_add_state(btn_sonos_scan, LV_STATE_DISABLED);
-        lv_obj_set_style_bg_color(btn_sonos_scan, COL_BORDER, LV_STATE_DISABLED);
-    }
-
-    // Show spinner
-    if (spinner_scan) {
-        Serial.println("[SCAN] Showing spinner");
-        lv_obj_set_hidden(spinner_scan, false);
-        lv_obj_move_foreground(spinner_scan);  // Bring to front
-    } else {
-        Serial.println("[SCAN] ERROR: spinner_scan is NULL!");
-    }
-
-    lv_label_set_text(lbl_status, "Scanning for speakers...");
-    lv_obj_set_style_text_color(lbl_status, COL_ACCENT, 0);
-    lv_obj_clean(list_devices);
-    lv_refr_now(NULL);  // Force immediate screen refresh
-
-    int cnt = sonos.discoverDevices();
-
+static void discoverFinished(int cnt) {
     // Hide spinner
     if (spinner_scan) {
         lv_obj_set_hidden(spinner_scan, true);
@@ -306,10 +517,69 @@ void ev_discover(lv_event_t* e) {
     refreshDeviceList();
 }
 
+void ev_discover(lv_event_t* e) {
+    Serial.println("[SCAN] Scan button pressed");
+
+    if (speakerScanBusy()) {
+        lv_label_set_text(lbl_status, "A scan is already running");
+        return;
+    }
+    // A group edit holds a devices[] index that a scan would invalidate.
+    if (groupEditBusy()) {
+        lv_label_set_text(lbl_status, "A group change is in progress");
+        return;
+    }
+
+    // Disable scan button during discovery
+    if (btn_sonos_scan) {
+        lv_obj_add_state(btn_sonos_scan, LV_STATE_DISABLED);
+        lv_obj_set_style_bg_color(btn_sonos_scan, COL_BORDER, LV_STATE_DISABLED);
+    }
+
+    // Show spinner
+    if (spinner_scan) {
+        Serial.println("[SCAN] Showing spinner");
+        lv_obj_set_hidden(spinner_scan, false);
+        lv_obj_move_foreground(spinner_scan);  // Bring to front
+    } else {
+        Serial.println("[SCAN] ERROR: spinner_scan is NULL!");
+    }
+
+    lv_label_set_text(lbl_status, "Scanning for speakers...");
+    lv_obj_set_style_text_color(lbl_status, COL_ACCENT, 0);
+    lv_obj_clean(list_devices);
+
+    // The scan (15 s SSDP plus a room-name fetch per speaker) runs on its own task;
+    // discoverFinished() repaints when it returns.
+    if (!speakerScanStart(false, discoverFinished)) discoverFinished(-1);
+}
+
 // ============================================================================
 // WiFi Event Handlers
 // ============================================================================
+static void wifiScanFinished(int n);
+
+// WiFi.disconnect() and the blocking WiFi.scanNetworks() are RPCs to the C6 over
+// esp-hosted; they run on a one-shot task so the panel keeps drawing. The result
+// list stays in the driver, so wifiScanFinished() reads it with SSID(i)/RSSI(i)
+// on the LVGL task without another RPC.
+struct WifiScanJob { int n; };
+
+static void wifiScanWork(void* p) {
+    WiFi.disconnect();
+    vTaskDelay(pdMS_TO_TICKS(100));
+    ((WifiScanJob*)p)->n = WiFi.scanNetworks();
+}
+
+static void wifiScanDone(void* p) {
+    int n = ((WifiScanJob*)p)->n;
+    delete (WifiScanJob*)p;
+    wifi_user_op_in_progress = false;
+    wifiScanFinished(n);
+}
+
 void ev_wifi_scan(lv_event_t* e) {
+    if (wifi_user_op_in_progress) return;
     // Disable button and show loading state
     if (btn_wifi_scan) {
         lv_obj_add_state(btn_wifi_scan, LV_STATE_DISABLED);
@@ -330,16 +600,17 @@ void ev_wifi_scan(lv_event_t* e) {
         lv_obj_set_hidden(spinner_wifi_scan, false);
         lv_obj_move_foreground(spinner_wifi_scan);
     }
-    // lv_refr_now, NOT lv_timer_handler: we are inside an event callback, which
-    // runs inside the outer lv_timer_handler(), and LVGL's already_running guard
-    // makes a nested call return immediately without drawing. The spinner and
-    // the status text would never appear before the blocking scan below.
-    lv_refr_now(NULL);  // Update UI immediately
 
-    WiFi.disconnect();
-    vTaskDelay(pdMS_TO_TICKS(100));
+    wifi_user_op_in_progress = true;
+    WifiScanJob* job = new (std::nothrow) WifiScanJob{-1};
+    if (!job || !uiOffloadStart("WiFiScan", 6144, wifiScanWork, wifiScanDone, job)) {
+        delete job;
+        wifi_user_op_in_progress = false;
+        wifiScanFinished(-1);
+    }
+}
 
-    int n = WiFi.scanNetworks();
+static void wifiScanFinished(int n) {
     wifiNetworkCount = min(n, 20);
 
     // Hide spinner, re-enable button
@@ -398,6 +669,9 @@ void ev_wifi_scan(lv_event_t* e) {
         lv_obj_set_style_radius(btn, 10, 0);
         lv_obj_set_style_shadow_width(btn, 0, 0);
         lv_obj_add_event_cb(btn, [](lv_event_t* e) {
+            // A connect in flight still reads selectedSSID (wifiConnectFinish saves it
+            // with the typed password); the old blocking connect made this tap impossible.
+            if (wifi_user_op_in_progress) return;
             int idx = (int)(intptr_t)lv_obj_get_user_data((lv_obj_t*)lv_event_get_target(e));
             selectedSSID = wifiNetworks[idx];
             // Show password strip + update SSID label
@@ -425,7 +699,33 @@ void ev_wifi_scan(lv_event_t* e) {
     WiFi.scanDelete();
 }
 
+// The connect wait used to be a 30 s while loop in this handler (vTaskDelay,
+// WDT feeds, lv_refr_now), so touch was dead until it ended. It is now a 500 ms
+// lv_timer with the same 60-tick budget; the NVS writes in wifiConnectFinish()
+// still run on mainAppTask (timer callback, internal SRAM stack).
+static lv_timer_t* s_conn_timer = nullptr;
+static int         s_conn_tries = 0;
+static String      s_conn_pwd;
+
+static void wifiConnectFinish();
+
+static void wifiConnectTick(lv_timer_t* t) {
+    if (WiFi.status() != WL_CONNECTED && s_conn_tries++ < 60) {
+        int tries = s_conn_tries;
+        lv_label_set_text_fmt(lbl_wifi_status, MDI_REFRESH " Connecting to %s%s",
+            selectedSSID.c_str(),
+            tries % 4 == 0 ? "..." : tries % 4 == 1 ? ".  " : tries % 4 == 2 ? ".. " : " ..");
+        return;
+    }
+    lv_timer_delete(t);
+    s_conn_timer = nullptr;
+    wifi_user_op_in_progress = false;
+    wifiConnectFinish();
+    s_conn_pwd = "";
+}
+
 void ev_wifi_connect(lv_event_t* e) {
+    if (wifi_user_op_in_progress || s_conn_timer) return;
     if (selectedSSID.length() == 0) {
         lv_label_set_text(lbl_wifi_status, MDI_ALERT " Please select a network first");
         lv_obj_set_style_text_color(lbl_wifi_status, COL_ERROR, 0);
@@ -442,7 +742,6 @@ void ev_wifi_connect(lv_event_t* e) {
     lv_label_set_text_fmt(lbl_wifi_status, MDI_REFRESH " Connecting to %s...", selectedSSID.c_str());
     lv_obj_set_style_text_color(lbl_wifi_status, COL_ACCENT, 0);
     lv_obj_set_hidden(kb, true);
-    lv_refr_now(NULL);  // Update UI (nested lv_timer_handler would be a no-op)
 
     WiFi.disconnect();
     vTaskDelay(pdMS_TO_TICKS(100));
@@ -456,23 +755,21 @@ void ev_wifi_connect(lv_event_t* e) {
     pending_wifi_pass = pwd;
     wifi_creds_need_save = true;
 
-    // Non-blocking connection with visual feedback (max 30 seconds — mesh/Orbi can be slow).
-    // MUST reset the hardware WDT each iteration: this function runs on mainAppTask which is
-    // registered with the 30s WDT. The loop itself takes up to 30s → WDT fires at loop end.
-    int tries = 0;
-    while (WiFi.status() != WL_CONNECTED && tries++ < 60) {
-        esp_task_wdt_reset();  // Feed WDT — loop runs up to 30s, WDT timeout = 30s
-        vTaskDelay(pdMS_TO_TICKS(500));
-        lv_label_set_text_fmt(lbl_wifi_status, MDI_REFRESH " Connecting to %s%s",
-            selectedSSID.c_str(),
-            tries % 4 == 0 ? "..." : tries % 4 == 1 ? ".  " : tries % 4 == 2 ? ".. " : " ..");
-        // Repaint AFTER updating the label, and with lv_refr_now: this runs
-        // inside an event callback, so a nested lv_timer_handler() hits LVGL's
-        // already_running guard and returns without drawing. The animated dots
-        // never rendered — the screen simply froze for up to 30s.
-        lv_refr_now(NULL);  // Keep UI responsive
+    // Wait for the link without blocking (max 30 seconds, mesh/Orbi can be slow):
+    // wifiConnectTick() polls every 500 ms and calls wifiConnectFinish().
+    s_conn_pwd = pwd;
+    wifi_user_op_in_progress = true;
+    s_conn_tries = 0;
+    s_conn_timer = lv_timer_create(wifiConnectTick, 500, nullptr);
+    if (!s_conn_timer) {
+        wifi_user_op_in_progress = false;
+        wifiConnectFinish();
+        s_conn_pwd = "";
     }
-    esp_task_wdt_reset();  // Reset after loop exits (NVS write below can take ~100ms)
+}
+
+static void wifiConnectFinish() {
+    const char* pwd = s_conn_pwd.c_str();
 
     // Re-enable button
     if (btn_wifi_connect) {
@@ -535,31 +832,21 @@ void ev_wifi_connect(lv_event_t* e) {
 // fleet a silent DOWNGRADE with an "Update available" label. Parsing stops at the
 // first non-digit/non-dot, so a "-nightly.abc1234" suffix is ignored here.
 static bool isSemverNewer(const String& candidate, const String& current) {
-    auto parse = [](const String& v, int out[3]) {
-        out[0] = out[1] = out[2] = 0;
-        int part = 0, val = 0;
-        for (unsigned i = 0; i < v.length() && part < 3; i++) {
-            char c = v[i];
-            if (c >= '0' && c <= '9')      val = val * 10 + (c - '0');
-            else if (c == '.')           { out[part++] = val; val = 0; }
-            else break;                    // prerelease suffix ends the numeric part
-        }
-        if (part < 3) out[part] = val;
-    };
-    int a[3], b[3];
-    parse(candidate, a);
-    parse(current, b);
-    for (int i = 0; i < 3; i++) if (a[i] != b[i]) return a[i] > b[i];
-    return false;                          // numerically equal is not newer
+    return auto_update::semverNewer(candidate.c_str(), current.c_str());   // include/auto_update.h
 }
 
-static void checkForUpdates() {
+// The update check is split in three so the network part can run on its own task
+// (checkForUpdatesAsync): otaCheckBegin() and otaApplyRelease() touch LVGL and run
+// on the LVGL task; otaFetchRelease() does the TLS GET and calls no lv_* function.
+static const int kOtaFetchNoMutex = -1000;   // otaFetchRelease(): network_mutex not taken
+
+static bool otaCheckBegin() {
     if (WiFi.status() != WL_CONNECTED) {
         if (lbl_ota_status) {
             lv_label_set_text(lbl_ota_status, MDI_ALERT " No WiFi connection");
             lv_obj_set_style_text_color(lbl_ota_status, COL_ERROR, 0);
         }
-        return;
+        return false;
     }
 
     // CRITICAL: Prevent rapid clicking - minimum 5 seconds between checks
@@ -572,7 +859,7 @@ static void checkForUpdates() {
             lv_label_set_text_fmt(lbl_ota_status, MDI_ALERT " Please wait %lu seconds", wait_sec);
             lv_obj_set_style_text_color(lbl_ota_status, COL_WARN, 0);
         }
-        return;
+        return false;
     }
     last_check_time = now;
 
@@ -583,8 +870,13 @@ static void checkForUpdates() {
         lv_label_set_text(lbl_ota_status, MDI_REFRESH " Checking for updates...");
         lv_obj_set_style_text_color(lbl_ota_status, COL_ACCENT, 0);
     }
-    lv_refr_now(NULL);  // nested lv_timer_handler would be a no-op; see ev_wifi_scan
+    return true;
+}
 
+// Network half of the check: no lv_* calls, safe on any task. Returns the HTTP
+// code (negative on transport failure, kOtaFetchNoMutex if the radio was busy).
+static int otaFetchRelease(String& payload) {
+    unsigned long now;
     WiFiClientSecure client;
     client.setInsecure();  // Skip certificate validation
 
@@ -606,12 +898,7 @@ static void checkForUpdates() {
     // CRITICAL: Acquire network_mutex BEFORE http.begin() to prevent SDIO overlap
     if (!xSemaphoreTake(network_mutex, pdMS_TO_TICKS(NETWORK_MUTEX_TIMEOUT_MS))) {
         Serial.println("[OTA] Failed to acquire network mutex - check aborted");
-        if (lbl_ota_status) {
-            lv_label_set_text(lbl_ota_status, MDI_ALERT " Network busy, try again");
-            lv_obj_set_style_text_color(lbl_ota_status, COL_ERROR, 0);
-        }
-        if (btn_check_update) lv_obj_remove_state(btn_check_update, LV_STATE_DISABLED);
-        return;
+        return kOtaFetchNoMutex;
     }
 
     // CRITICAL: Wait for general SDIO cooldown (200ms since last network op)
@@ -629,7 +916,7 @@ static void checkForUpdates() {
     }
 
     int httpCode = -1;
-    String payload = "";
+    payload = "";
 
     // Retry once on connection failure — TLS to api.github.com needs ~114KB DMA;
     // a brief wait lets previous sessions fully release their DMA buffers.
@@ -675,6 +962,19 @@ static void checkForUpdates() {
 
     // Release mutex after ALL network activity including TLS cleanup
     xSemaphoreGive(network_mutex);
+    return httpCode;
+}
+
+// Result half of the check: LVGL task only.
+static void otaApplyRelease(int httpCode, const String& payload) {
+    if (httpCode == kOtaFetchNoMutex) {
+        if (lbl_ota_status) {
+            lv_label_set_text(lbl_ota_status, MDI_ALERT " Network busy, try again");
+            lv_obj_set_style_text_color(lbl_ota_status, COL_ERROR, 0);
+        }
+        if (btn_check_update) lv_obj_remove_state(btn_check_update, LV_STATE_DISABLED);
+        return;
+    }
 
     if (btn_check_update) lv_obj_remove_state(btn_check_update, LV_STATE_DISABLED);
 
@@ -909,6 +1209,62 @@ static void checkForUpdates() {
     }
 }
 
+// Synchronous check. Only triggerPendingOTA() uses it: the boot path on loopTask,
+// before the LVGL loop runs, so blocking there freezes nothing the user can touch.
+static void checkForUpdates() {
+    if (!otaCheckBegin()) return;
+    lv_refr_now(NULL);  // nested lv_timer_handler would be a no-op; see ev_wifi_scan
+    String payload;
+    int code = otaFetchRelease(payload);
+    otaApplyRelease(code, payload);
+}
+
+// The check from Settings and the daily background check. The TLS GET used to run
+// on mainAppTask with the watchdog unsubscribed for up to ~40 s, and on its 8 KB
+// stack (config.h MAIN_APP_TASK_STACK). It now runs on a one-shot 8 KB internal
+// stack task (lyrics does HTTPS + JSON in 8192), and the result is applied on the
+// LVGL task.
+static volatile bool s_upd_busy = false;
+
+struct UpdJob {
+    bool   background;
+    int    code;
+    String payload;
+};
+
+static void otaAfterBackgroundCheck();
+
+static void updCheckWork(void* p) {
+    UpdJob* job = (UpdJob*)p;
+    job->code = otaFetchRelease(job->payload);
+}
+
+static void updCheckDone(void* p) {
+    UpdJob* job = (UpdJob*)p;
+    otaApplyRelease(job->code, job->payload);
+    if (job->background) otaAfterBackgroundCheck();
+    delete job;
+    s_upd_busy = false;
+}
+
+static bool checkForUpdatesAsync(bool background) {
+    if (s_upd_busy) return false;
+    if (!otaCheckBegin()) return false;
+    s_upd_busy = true;
+    UpdJob* job = new (std::nothrow) UpdJob{background, -1, String()};
+    if (!job || !uiOffloadStart("UpdCheck", 8192, updCheckWork, updCheckDone, job)) {
+        delete job;
+        s_upd_busy = false;
+        if (btn_check_update) lv_obj_remove_state(btn_check_update, LV_STATE_DISABLED);
+        if (lbl_ota_status) {
+            lv_label_set_text(lbl_ota_status, MDI_ALERT " Could not start the check");
+            lv_obj_set_style_text_color(lbl_ota_status, COL_ERROR, 0);
+        }
+        return false;
+    }
+    return true;
+}
+
 // Helper: Restore all tasks and state after OTA failure
 static void otaRecovery() {
     // Close HTTP/TLS cleanup
@@ -1071,7 +1427,7 @@ static void otaCheckDMA() {
     // Only reboot if DMA is STILL insufficient after 15s. That would indicate an
     // mbedTLS DMA leak from a force-killed task — extremely rare with clean shutdown.
     uint32_t free_dma = heap_caps_get_free_size(MALLOC_CAP_DMA);
-    Serial.printf("[OTA] DMA after task cleanup: %d bytes (need %d)\n", free_dma, OTA_TARGET_FREE_DMA);
+    Serial.printf("[OTA] DMA after task cleanup: %d bytes (need %d)\n", (int)free_dma, OTA_TARGET_FREE_DMA);
 
     if (free_dma < OTA_TARGET_FREE_DMA) {
         // TIME_WAIT sockets are still alive — poll until they expire (up to 15s).
@@ -1087,7 +1443,7 @@ static void otaCheckDMA() {
             free_dma = heap_caps_get_free_size(MALLOC_CAP_DMA);
             uint32_t elapsed = (millis() - poll_start) / 1000;
             Serial.printf("[OTA] DMA: %d bytes (need %d) — %lus elapsed\n",
-                free_dma, OTA_TARGET_FREE_DMA, (unsigned long)elapsed);
+                (int)free_dma, OTA_TARGET_FREE_DMA, (unsigned long)elapsed);
             if (lbl_ota_status) {
                 lv_label_set_text_fmt(lbl_ota_status,
                     MDI_REFRESH " Freeing memory... (%d/%d KB)",
@@ -1100,7 +1456,7 @@ static void otaCheckDMA() {
             // Plateau detection: if DMA hasn't changed in 3s, reboot now
             if (free_dma == prev_dma) {
                 if (++plateau_count >= OTA_DMA_PLATEAU_COUNT) {
-                    Serial.printf("[OTA] DMA plateaued at %d bytes — restarting early\n", free_dma);
+                    Serial.printf("[OTA] DMA plateaued at %d bytes — restarting early\n", (int)free_dma);
                     break;
                 }
             } else {
@@ -1115,7 +1471,7 @@ static void otaCheckDMA() {
         // force-killed task. Only a full restart can reclaim it.
         // Save URL to NVS; auto-trigger on next boot skips checkForUpdates() HTTPS.
         Serial.printf("[OTA] DMA still insufficient (%d / %d) — restarting\n",
-            free_dma, OTA_TARGET_FREE_DMA);
+            (int)free_dma, OTA_TARGET_FREE_DMA);
         Preferences prefs;
         prefs.begin(NVS_NAMESPACE, false);
         prefs.putBool(NVS_KEY_OTA_PENDING, true);
@@ -1313,7 +1669,7 @@ static void performOTAUpdate() {
         Serial.println("[OTA] ========================================");
         Serial.printf("[OTA] DOWNLOAD ATTEMPT %d/%d\n", attempt, OTA_TLS_MAX_RETRIES);
         Serial.printf("[OTA] Free DMA: %d bytes | Free heap: %d bytes\n",
-            heap_caps_get_free_size(MALLOC_CAP_DMA), ESP.getFreeHeap());
+            heap_caps_get_free_size(MALLOC_CAP_DMA), (int)ESP.getFreeHeap());
         Serial.println("[OTA] ========================================");
 
         // Update UI BEFORE GET() — lv_refr_now() after GET() causes a ~50ms delay during
@@ -1691,18 +2047,32 @@ static void performOTAUpdate() {
 }
 
 void ev_check_update(lv_event_t* e) {
-    // Same watchdog bracket as otaBackgroundCheckTick(), and for the same
-    // reason. This is an LVGL event callback, so it runs inside
-    // lv_timer_handler() — which is only ever called from mainAppTask, the
-    // watchdog-subscribed task. loopTask is idle and is not subscribed in
-    // steady state. checkForUpdates() can block for 5s mutex + 2.2s cooldowns
-    // + two (connect 5s + read OTA_CHECK_TIMEOUT_MS) attempts + a 3s retry gap
-    // = ~37s against a 30s WATCHDOG_TIMEOUT_SEC with trigger_panic=true, so a
-    // user tapping "Check for Updates" behind a captive portal that accepts
-    // :443 and goes quiet panics the panel.
-    esp_task_wdt_delete(NULL);
-    checkForUpdates();
-    esp_task_wdt_add(NULL);
+    checkForUpdatesAsync(false);
+}
+
+// Background check state. File statics (they were function statics) so that
+// otaAfterBackgroundCheck(), which runs when the async check finishes, can set them.
+static bool   s_toast_pending = false;
+static bool   s_auto_armed = false;
+static String s_armed_ver, s_armed_url;
+
+// Runs on the LVGL task after a background check has applied its result.
+static void otaAfterBackgroundCheck() {
+    s_toast_pending = true;     // announced on the next iteration
+    // Stable only: on Nightly "newer" means "any different build", which would turn
+    // auto-install into a loop between whichever two builds were published last.
+    const bool can_arm = auto_update_enabled && ota_channel == 0 &&
+                         ota_update_available && !download_url.isEmpty();
+    if (can_arm && !kAutoInstallSourceOk) {
+        // Say so once per check, so a log explains why nothing installed itself.
+        Serial.printf("[OTA] Auto-install is off: updates come from %s (upstream). "
+                      "See docs/guide/updates.md\n", GITHUB_REPO);
+    }
+    s_auto_armed = can_arm && kAutoInstallSourceOk;
+    if (s_auto_armed) {
+        s_armed_ver = latest_version;
+        s_armed_url = download_url;
+    }
 }
 
 // Background update check, called once per mainAppTask iteration.
@@ -1711,11 +2081,11 @@ void ev_check_update(lv_event_t* e) {
 // from the Updates screen's own button, so the only way to hear about a release
 // was to go looking for it. That is why the toast needed this to exist at all.
 //
-// Runs on mainAppTask, the same thread as lv_timer_handler(), so the LVGL work
-// inside checkForUpdates() and the toast are both on the right thread.
+// Runs on mainAppTask, the same thread as lv_timer_handler(), so the toast and
+// the LVGL halves of the check (otaCheckBegin, otaApplyRelease) are on the right
+// thread; the TLS GET itself runs on the UpdCheck task.
 void otaBackgroundCheckTick() {
     static uint32_t next_check_ms = OTA_BGCHECK_FIRST_MS;
-    static bool     toast_pending = false;
 
     // Show a result found on a previous tick. Separated from the check itself so
     // the toast never appears in the same iteration as an HTTPS session — the
@@ -1724,10 +2094,10 @@ void otaBackgroundCheckTick() {
     // Never over the screensaver. The toast lives on lv_layer_top(), so it draws
     // above scr_clock and takes the tap that would otherwise reach the clock's
     // own LV_EVENT_CLICKED handler — the only thing that calls exitClockScreen()
-    // in CLOCK_MODE_INACTIVITY. Loading scr_ota from under it leaves clock_state
+    // while nothing is playing. Loading scr_ota from under it leaves clock_state
     // at CLOCK_ACTIVE with art_shutdown_requested still set, so album art and
     // lyrics never come back and clockBgTask keeps fetching photos. Hold the
-    // notice instead: toast_pending stays set and it appears once the user is
+    // notice instead: s_toast_pending stays set and it appears once the user is
     // back on a real screen.
     // toast_owed stays set after the first show, deliberately. If the
     // screensaver takes the toast away before the user acts, updateToastHide()
@@ -1741,7 +2111,56 @@ void otaBackgroundCheckTick() {
     // compare and cannot produce a second toast or re-nag a notice the user
     // ignored or tapped. Those two paths leave the dedupe set on purpose.
     static bool toast_owed = false;
-    if (toast_pending) { toast_pending = false; toast_owed = true; }
+    if (s_toast_pending) { s_toast_pending = false; toast_owed = true; }
+
+    // Auto-update. The daily check arms it; the install waits for a panel that has
+    // been left alone, then reuses the manual path (URL to NVS, restart, install
+    // at the start of the next boot where DMA headroom is greatest). Each version
+    // is tried once automatically: if it fails, the panel recovers and keeps
+    // running, and the user can still install by hand rather than being put in a
+    // restart loop by a release that does not take.
+    //
+    // The version and URL are copied at arm time. Opening the Update screen
+    // clears download_url and latest_version (its SCREEN_LOADED handler), which
+    // used to disarm a pending install silently; the copies survive that, and are
+    // put back just before the install so ev_install_update() finds them.
+    // The decision itself is auto_update::installGate (include/auto_update.h).
+    // Not while a check is in flight: its result may still re-arm or disarm this.
+    if (s_auto_armed && !s_upd_busy) {
+        // One idle reading for both uses below (they used to read it twice).
+        const uint32_t idle = millis() - last_touch_time;
+        // NVS is read only once the cheap conditions pass, not on every tick.
+        const bool idle_ok = !ota_in_progress && WiFi.status() == WL_CONNECTED &&
+                             idle >= AUTOUPDATE_IDLE_MS;
+        const String tried = idle_ok ? wifiPrefs.getString(NVS_KEY_AUTO_UPD_VER, "") : String("");
+        const auto_update::Gate gate = auto_update::installGate(
+            auto_update_enabled, ota_channel, kAutoInstallSourceOk,
+            true, true,
+            WiFi.status() == WL_CONNECTED && !ota_in_progress,
+            idle, AUTOUPDATE_IDLE_MS,
+            s_armed_ver.c_str(), tried.c_str());
+        switch (gate) {
+            case auto_update::Gate::Allowed:
+                // Record the attempt FIRST: if the restart or the install fails,
+                // the next boot sees this version as already tried.
+                wifiPrefs.putString(NVS_KEY_AUTO_UPD_VER, s_armed_ver);
+                download_url   = s_armed_url;
+                latest_version = s_armed_ver;
+                Serial.printf("[OTA] Auto-update: installing %s\n", s_armed_ver.c_str());
+                s_auto_armed = false;
+                ev_install_update(nullptr);       // restarts the panel
+                break;
+            case auto_update::Gate::Disabled:
+            case auto_update::Gate::WrongChannel:
+            case auto_update::Gate::SourceNotAllowed:
+            case auto_update::Gate::AlreadyTried:
+                Serial.printf("[OTA] Auto-update dropped: %s\n", auto_update::gateName(gate));
+                s_auto_armed = false;
+                break;
+            default:                              // NotIdle, Offline, NoAsset: keep waiting
+                break;
+        }
+    }
     if (toast_owed && clock_state == CLOCK_IDLE &&
         ota_update_available && latest_version.length() > 0) {
         updateToastShow(latest_version.c_str());
@@ -1757,6 +2176,12 @@ void otaBackgroundCheckTick() {
     // what lastWifiCheck/lastHeapLog in main.cpp already use.
     if ((int32_t)(millis() - next_check_ms) < 0) return;
 
+    // A check (manual or background) is still running on its task: look again shortly.
+    if (s_upd_busy) {
+        next_check_ms = millis() + OTA_BGCHECK_RETRY_MS;
+        return;
+    }
+
     // Re-arm first, so every early return below still backs off a full interval
     // rather than retrying this condition on the very next iteration.
     next_check_ms = millis() + OTA_BGCHECK_INTERVAL_MS;
@@ -1770,7 +2195,14 @@ void otaBackgroundCheckTick() {
     // session out of the photo window; splitting the flags without adding it
     // here would let a handshake start during an in-flight Bing download — a
     // new overlap, on an SDIO path, introduced by the fix itself.
-    if (ota_in_progress || art_download_in_progress || clock_photo_in_progress) {
+    //
+    // And never while someone is using the panel. The check used to run on the
+    // LVGL task and block it for seconds (TLS to GitHub, up to ~37 s on a bad
+    // link), so a check that started mid-navigation froze Settings. It still
+    // waits for SYNC_IDLE_MS without a touch, so its radio time and the result
+    // repaint stay away from someone using the panel.
+    if (ota_in_progress || art_download_in_progress || clock_photo_in_progress ||
+        (uint32_t)(millis() - last_touch_time) < SYNC_IDLE_MS) {
         next_check_ms = millis() + OTA_BGCHECK_RETRY_MS;   // look again shortly
         return;
     }
@@ -1784,42 +2216,13 @@ void otaBackgroundCheckTick() {
 
     Serial.println("[UPDATE] Background check");
 
-    // Unsubscribe from the task watchdog across the check, then re-subscribe.
-    //
-    // mainAppTask is the only WDT-subscribed task in steady state and feeds the
-    // dog once per loop iteration (main.cpp). checkForUpdates() contains no
-    // esp_task_wdt_reset() of its own and can block far longer than the 30s
-    // WATCHDOG_TIMEOUT_SEC: mutex 5s + cooldowns 2.2s + TLS connect 5s + a
-    // header stall at OTA_CHECK_TIMEOUT_MS + a body stall at the same, plus one
-    // retry. A connection that opens and then goes quiet — the documented
-    // signature of esp-hosted #184, and equally a captive portal that accepts
-    // :443 and never answers — reaches ~40s and panics with trigger_panic=true.
-    //
-    // Because next_check_ms is a function static, the reboot rearms it at
-    // OTA_BGCHECK_FIRST_MS: a persistently stalling path would reboot the panel
-    // every ten minutes indefinitely, unattended.
-    //
-    // The Updates-screen button reaches the same code and needs the same
-    // bracket — see ev_check_update(). An earlier version of this comment
-    // claimed that path was safe because "loopTask is the subscriber"; that is
-    // wrong. lv_timer_handler() is only called from mainAppTask, so an LVGL
-    // event callback runs on the watchdog-subscribed task too. What is new here
-    // is that it happens unattended and repeats.
-    //
-    // Known trade: while unsubscribed the task is genuinely unwatched, so a
-    // slow-drip response body (HTTPClient restarts its timeout on every byte —
-    // config.h records one download sitting inside HTTPS for 209 SECONDS)
-    // freezes the panel instead of rebooting it. For a once-a-day check against
-    // api.github.com that is the better failure, but it is a trade, not a bound.
-    //
-    // Unsubscribing is safe because the operation is bounded by its own
-    // timeouts — it always returns — so the worst case becomes a slow tick
-    // rather than a reboot loop. The user-initiated path is left alone.
-    esp_task_wdt_delete(NULL);
-    checkForUpdates();          // sets ota_update_available + latest_version
-    esp_task_wdt_add(NULL);
-
-    toast_pending = true;       // announced on the next iteration
+    // The TLS GET runs on the UpdCheck task (checkForUpdatesAsync), not here.
+    // On mainAppTask it could block for ~40 s (mutex 5 s, cooldowns 2.2 s, two
+    // connect + read attempts, a 3 s retry gap) against the 30 s watchdog, so it
+    // had to unsubscribe the watchdog and left the panel frozen and unwatched.
+    // mainAppTask now keeps feeding the watchdog; otaAfterBackgroundCheck()
+    // queues the toast and arms the auto-update when the result is applied.
+    checkForUpdatesAsync(true);
 }
 
 void ev_install_update(lv_event_t* e) {
@@ -1852,6 +2255,12 @@ void ev_install_update(lv_event_t* e) {
     }
     lv_tick_inc(10);
     lv_refr_now(NULL);
+    // Quiesce the Sonos tasks before the reset, so a SOAP call in flight is not
+    // cut mid-transfer with SDIO buffers held. Same null guard as otaRecovery():
+    // before sonos.begin() the controller's queues and mutex are NULL.
+    // suspendTasks() waits at most 5 s, well under the 30 s task watchdog.
+    // After the repaint so the message is on screen while it waits.
+    if (sonos.getDeviceMutex()) sonos.suspendTasks();
     vTaskDelay(pdMS_TO_TICKS(1500));  // let user see the message
     rebootNoteCause(reboot_log::CAUSE_OTA);
     display_set_brightness(0);
@@ -1931,7 +2340,7 @@ static bool updateConnectionState(SonosDevice* d) {
 
     if (d->connected != last_conn_state) {
         Serial.printf("[UI] Connection state changed: %s (errorCount=%d)\n",
-                     d->connected ? "CONNECTED" : "DISCONNECTED", d->errorCount);
+                     d->connected ? "CONNECTED" : "DISCONNECTED", (int)d->errorCount);
         last_conn_state = d->connected;
     }
 
@@ -1973,6 +2382,12 @@ static bool updateConnectionState(SonosDevice* d) {
             lv_label_set_text(lbl, MDI_PLAY);
             lv_obj_set_style_text_font(lbl, &lv_font_mdi_40, 0);
             lv_obj_center(lbl);
+            // Keep the cached play state in step with the glyph. updateUI() is the
+            // only other writer and it returns before reaching it while
+            // disconnected, so a stale true here would block checkClockTrigger()
+            // in every mode and, on reconnect while still playing, leave the
+            // play glyph showing instead of pause.
+            ui_playing = false;
 
             ui_title = "";
             ui_artist = "";
@@ -2779,9 +3194,18 @@ void processUpdates() {
     UIUpdate_t upd;
     bool need = false;
     bool queue_updated = false;
+    bool groups_updated = false;
     while (xQueueReceive(sonos.getUIUpdateQueue(), &upd, 0)) {
         need = true;
         if (upd.type == UPDATE_QUEUE) queue_updated = true;
+        if (upd.type == UPDATE_GROUPS) groups_updated = true;
+    }
+    // The topology was re-read (by the background refresh, a group change in the
+    // Sonos app, or the Groups screen opening): repaint whichever list is showing.
+    if (groups_updated) {
+        lv_obj_t* active = lv_screen_active();
+        if (active == scr_groups)       refreshGroupsList();
+        else if (active == scr_devices) refreshDeviceList();
     }
     if (need && (millis() - lastUpdate > 200)) { updateUI(); lastUpdate = millis(); }
     else displayCompletedArt();  // Run even without Sonos events (e.g. art ready while polling suppressed)

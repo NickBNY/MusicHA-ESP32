@@ -574,6 +574,8 @@ void createLyricsOverlay(lv_obj_t* parent) {
     lv_obj_set_style_pad_right(lyrics_container, SX(12), 0);
     lv_obj_set_scrollable(lyrics_container, false);
     lv_obj_set_scrollbar_mode(lyrics_container, LV_SCROLLBAR_MODE_OFF);
+    // Display only: let taps reach the album art (Favorites) and the Lyrics button.
+    lv_obj_remove_flag(lyrics_container, LV_OBJ_FLAG_CLICKABLE);
 
     // Flex column layout, centered
     lv_obj_set_flex_flow(lyrics_container, LV_FLEX_FLOW_COLUMN);
@@ -772,14 +774,20 @@ void updateLyricsStatus() {
         // control rather than an inactive indicator.
         // No early return here: the lbl_lyrics_status handling further down
         // still has to clear itself when disabled.
-        lv_obj_set_hidden(btn_lyrics, !lyrics_enabled);
+        // Amber's "Lyrics on/off" is a clickable toggle and must stay on screen
+        // when lyrics are off, or there would be no way to turn them back on. It
+        // reads gold when on (full border once this track has lyrics) and muted
+        // when off. The other themes keep the indicator behaviour.
+        const bool toggle = lv_obj_has_flag(btn_lyrics, LV_OBJ_FLAG_CLICKABLE);
+        if (!toggle) lv_obj_set_hidden(btn_lyrics, !lyrics_enabled);
 
         const bool live = lyrics_enabled && lyrics_ready;
+        const bool lit  = toggle ? lyrics_enabled : live;
         lv_obj_set_style_text_color(lv_obj_get_child(btn_lyrics, 0),
-                                    live ? themeAccentColor() : themeMutedColor(), 0);
+                                    lit ? themeAccentColor() : themeMutedColor(), 0);
         lv_obj_set_style_border_color(btn_lyrics,
-                                      live ? themeAccentColor() : themeMutedColor(), 0);
-        lv_obj_set_style_border_opa(btn_lyrics, live ? LV_OPA_COVER : LV_OPA_40, 0);
+                                      lit ? themeAccentColor() : themeMutedColor(), 0);
+        lv_obj_set_style_border_opa(btn_lyrics, live || (toggle && lit) ? LV_OPA_COVER : LV_OPA_40, 0);
     }
 
     if (!lbl_lyrics_status) return;

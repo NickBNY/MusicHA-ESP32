@@ -233,9 +233,9 @@ void orbitTick(const struct tm* now) {
 
     lv_label_set_text(orb_icon, wmoGlyph(clock_wx_wmo, false));
     lv_label_set_text_fmt(orb_temp, "%d°", clock_wx_temp);
-    lv_label_set_text_fmt(orb_meta, "%s · feels %d° · humidity %d%% · wind %d km/h · UV %d",
+    lv_label_set_text_fmt(orb_meta, "%s · feels %d° · humidity %d%% · wind %d %s · UV %d",
                           wmoCondition(clock_wx_wmo), clock_wx_apparent,
-                          clock_wx_humidity, clock_wx_wind, clock_wx_uv);
+                          clock_wx_humidity, clock_wx_wind, clockWindUnit(), clock_wx_uv);
     lv_label_set_text(orb_rise, clock_wx_sunrise);
     lv_label_set_text(orb_set,  clock_wx_sunset);
 

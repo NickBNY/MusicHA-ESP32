@@ -9,6 +9,7 @@
 #include "ui_fonts.h"
 #include "amber_icons.h"
 #include "amber.h"
+#include <new>
 
 // Forward declaration
 lv_obj_t* createSettingsSidebar(lv_obj_t* screen, int activeIdx);
@@ -25,6 +26,42 @@ lv_obj_t* createSettingsSidebar(lv_obj_t* screen, int activeIdx);
 // loses that race often; 150ms rides out most of it and is imperceptible.
 // Bounded overall by the degraded flag: only the FIRST row can pay this.
 #define UI_DEVICE_SNAPSHOT_WAIT_MS 150
+
+// Join / leave are SOAP calls (each can wait 5 s for network_mutex plus 2 s of
+// HTTP, and the cascade loops over members), followed by a settle delay and a
+// topology re-read. Run inline in the row handler they froze the panel; they now
+// run on a one-shot task (uiOffloadStart) and the list repaints on the LVGL task.
+// One edit at a time: taps while one is in flight are ignored.
+static volatile bool s_grp_edit_busy = false;
+// Read by the Scan buttons: a scan rewrites devices[], and the edit holds an index into it.
+bool groupEditBusy() { return s_grp_edit_busy; }
+
+struct GroupEditJob { bool join; int idx; int coord; };
+
+static void groupEditWork(void* p) {
+    GroupEditJob* job = (GroupEditJob*)p;
+    if (job->join) sonos.joinGroupCascade(job->idx, job->coord);
+    else           sonos.leaveGroup(job->idx);
+    vTaskDelay(pdMS_TO_TICKS(500));
+    sonos.updateGroupInfo();
+}
+
+static void groupEditDone(void* p) {
+    s_grp_edit_busy = false;
+    delete (GroupEditJob*)p;
+    if (lv_screen_active() == scr_groups) refreshGroupsList();
+}
+
+static void groupEditStart(bool join, int idx, int coord) {
+    GroupEditJob* job = new (std::nothrow) GroupEditJob{join, idx, coord};
+    if (!job) { refreshGroupsList(); return; }
+    s_grp_edit_busy = true;
+    if (!uiOffloadStart("GrpEdit", 8192, groupEditWork, groupEditDone, job)) {
+        s_grp_edit_busy = false;
+        delete job;
+        refreshGroupsList();
+    }
+}
 
 void refreshGroupsList() {
     if (!list_groups) return;
@@ -251,12 +288,10 @@ void refreshGroupsList() {
                 lv_obj_add_event_cb(removeBtn, [](lv_event_t* e) {
                     lv_event_stop_bubbling(e);
                     int idx = (int)(intptr_t)lv_obj_get_user_data((lv_obj_t*)lv_event_get_target(e));
+                    // Not while a scan rewrites devices[]: the row's index would point at another speaker.
+                    if (s_grp_edit_busy || speakerScanBusy()) return;
                     lv_label_set_text(lbl_groups_status, "Removing from group...");
-                    lv_refr_now(NULL);
-                    sonos.leaveGroup(idx);
-                    vTaskDelay(pdMS_TO_TICKS(500));
-                    sonos.updateGroupInfo();
-                    refreshGroupsList();
+                    groupEditStart(false, idx, -1);
                 }, LV_EVENT_CLICKED, NULL);
             }
         }
@@ -394,19 +429,31 @@ void refreshGroupsList() {
 
                 lv_obj_add_event_cb(addBtn, [](lv_event_t* e) {
                     int idx = (int)(intptr_t)lv_obj_get_user_data((lv_obj_t*)lv_event_get_target(e));
+                    // Not while a scan rewrites devices[]: the row's index would point at another speaker.
+                    if (s_grp_edit_busy || speakerScanBusy()) return;
                     if (selected_group_coordinator >= 0) {
                         lv_label_set_text(lbl_groups_status, "Adding to group...");
-                        lv_refr_now(NULL);
                         // Cascade: if this speaker coordinates its own group, its members
                         // come along rather than being stranded behind it.
-                        sonos.joinGroupCascade(idx, selected_group_coordinator);
-                        vTaskDelay(pdMS_TO_TICKS(500));
-                        sonos.updateGroupInfo();
-                        refreshGroupsList();
+                        groupEditStart(true, idx, selected_group_coordinator);
                     }
                 }, LV_EVENT_CLICKED, NULL);
             }
         }
+    }
+}
+
+static void groupsScanFinished(int count) {
+    (void)count;
+    refreshGroupsList();
+
+    // Hide spinner and re-enable button
+    if (spinner_groups_scan) {
+        lv_obj_set_hidden(spinner_groups_scan, true);
+    }
+    if (btn_groups_scan) {
+        lv_obj_remove_state(btn_groups_scan, LV_STATE_DISABLED);
+        lv_obj_set_style_bg_color(btn_groups_scan, AMB_ACCENT, 0);
     }
 }
 
@@ -421,6 +468,14 @@ void createGroupsScreen() {
     // Title + Refresh button row
     btn_groups_scan = addScreenHeader(content, "Groups", AMB_IC_REFRESH " Scan");
     lv_obj_add_event_cb(btn_groups_scan, [](lv_event_t* e) {
+        if (speakerScanBusy()) {
+            lv_label_set_text(lbl_groups_status, "A scan is already running");
+            return;
+        }
+        if (groupEditBusy()) {
+            lv_label_set_text(lbl_groups_status, "A group change is in progress");
+            return;
+        }
         // Disable button during scan
         lv_obj_add_state(btn_groups_scan, LV_STATE_DISABLED);
         lv_obj_set_style_bg_color(btn_groups_scan, AMB_BORDER, LV_STATE_DISABLED);
@@ -445,28 +500,13 @@ void createGroupsScreen() {
         // unconditionally. A button labelled Scan that declines to scan because
         // it already holds one stale entry is the bug, not the optimisation.
         lv_label_set_text(lbl_groups_status, AMB_IC_REFRESH " Discovering speakers...");
-        lv_refr_now(NULL);  // Force immediate refresh to show spinner
-        sonos.discoverDevices();
+        // The rows hold devices[] indexes, and the scan rewrites devices[]: clear
+        // them so a stale row cannot be tapped while it runs.
+        if (list_groups) lv_obj_clean(list_groups);
 
-        // Now update group info
-        lv_label_set_text(lbl_groups_status, AMB_IC_REFRESH " Updating groups...");
-        lv_refr_now(NULL);  // Force immediate refresh
-
-        // Update group info with UI updates
-        int cnt = sonos.getDeviceCount();
-        for (int i = 0; i < cnt; i++) {
-            lv_tick_inc(10);
-            lv_refr_now(NULL);
-        }
-        sonos.updateGroupInfo();
-        refreshGroupsList();
-
-        // Hide spinner and re-enable button
-        if (spinner_groups_scan) {
-            lv_obj_set_hidden(spinner_groups_scan, true);
-        }
-        lv_obj_remove_state(btn_groups_scan, LV_STATE_DISABLED);
-        lv_obj_set_style_bg_color(btn_groups_scan, AMB_ACCENT, 0);
+        // Scan and group refresh run on their own task (speakerScanStart);
+        // groupsScanFinished() repaints on the LVGL task when they return.
+        if (!speakerScanStart(true, groupsScanFinished)) groupsScanFinished(-1);
     }, LV_EVENT_CLICKED, NULL);
 
     // Status label

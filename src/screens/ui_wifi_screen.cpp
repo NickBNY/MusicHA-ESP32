@@ -64,9 +64,57 @@ static void wifiBarsUpdate(int32_t rssi, bool connected) {
     }
 }
 
+// ── Sampling off the LVGL task ───────────────────────────────────────────────
+// WiFi.RSSI() and WiFi.SSID() are RPCs to the C6 over esp-hosted SDIO. Called from
+// this timer and the SCREEN_LOADED handler they ran on the LVGL task, so opening
+// WiFi (or leaving it open) stalled touch and drawing whenever the SDIO link was
+// busy with art or lyrics. A one-shot task now samples both; the 500 ms timer
+// below only paints what the task left and starts the next sample every 5 s.
+// WiFi.status() and WiFi.localIP() stay here: a member read and an esp_netif read.
+static volatile bool s_busy = false;            // sample task running
+static volatile bool s_ready = false;           // s_rssi/s_ssid hold a new sample
+static int8_t   s_rssi = 0;
+static char     s_ssid[33] = "";
+static bool     s_have_sample = false;          // LVGL task only
+static uint32_t s_last_start = 0;
+static bool     s_status_pending = false;       // rewrite the status line with the SSID
+
+static void wifiSampleTask(void*) {
+    int8_t r = WiFi.RSSI();
+    String s = WiFi.SSID();
+    s_rssi = r;
+    strncpy(s_ssid, s.c_str(), sizeof(s_ssid) - 1);
+    s_ssid[sizeof(s_ssid) - 1] = '\0';
+    __sync_synchronize();                       // publish the sample before the flag
+    s_ready = true;
+    s_busy = false;
+    vTaskDelete(NULL);
+}
+
+static void wifiStatusConnected() {
+    lv_label_set_text_fmt(lbl_wifi_status,
+        AMB_IC_WIFI " Connected to %s  (%s)",
+        s_ssid, WiFi.localIP().toString().c_str());
+    lv_obj_set_style_text_color(lbl_wifi_status, AMB_LIVE, 0);
+}
+
 static void wifiRssiTick(lv_timer_t*) {
-    const bool up = (WiFi.status() == WL_CONNECTED);
-    wifiBarsUpdate(up ? WiFi.RSSI() : 0, up);
+    if (WiFi.status() != WL_CONNECTED) {
+        wifiBarsUpdate(0, false);
+        return;
+    }
+    if (s_ready) {
+        __sync_synchronize();
+        s_ready = false;
+        s_have_sample = true;
+        wifiBarsUpdate(s_rssi, true);
+        if (s_status_pending) { s_status_pending = false; wifiStatusConnected(); }
+    } else if (!s_busy && !ota_in_progress && (uint32_t)(millis() - s_last_start) >= 5000) {
+        s_last_start = millis();
+        s_busy = true;
+        if (xTaskCreatePinnedToCore(wifiSampleTask, "WiFiSample", 6144, NULL, 1, NULL, 1) != pdPASS)
+            s_busy = false;
+    }
 }
 
 // ============================================================================
@@ -316,17 +364,26 @@ void createWiFiScreen() {
     lv_obj_add_event_cb(scr_wifi, [](lv_event_t* e) {
         if (lv_event_get_code(e) != LV_EVENT_SCREEN_LOADED) return;
 
-        // Paint immediately, then keep it live. Without the first call the
-        // bars would sit blank for five seconds every time the screen opens.
-        wifiRssiTick(nullptr);
-        if (!wifi_rssi_timer) wifi_rssi_timer = lv_timer_create(wifiRssiTick, 5000, nullptr);
+        // No RPC here (see wifiSampleTask). Paint the last sample at once, and
+        // let the timer start a fresh one on its first tick (s_last_start is
+        // backdated 5 s so it is due at once) and rewrite the status line when
+        // it lands.
+        const bool up = (WiFi.status() == WL_CONNECTED);
+        s_status_pending = up;
+        s_last_start = millis() - 5000;
+        if (!wifi_rssi_timer) wifi_rssi_timer = lv_timer_create(wifiRssiTick, 500, nullptr);
 
-        if (WiFi.status() == WL_CONNECTED) {
-            lv_label_set_text_fmt(lbl_wifi_status,
-                AMB_IC_WIFI " Connected to %s  (%s)",
-                WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
-            lv_obj_set_style_text_color(lbl_wifi_status, AMB_LIVE, 0);
+        if (up) {
+            if (s_have_sample) {
+                wifiBarsUpdate(s_rssi, true);
+                wifiStatusConnected();
+            } else {
+                wifiBarsUpdate(0, false);
+                lv_label_set_text(lbl_wifi_status, AMB_IC_WIFI " Connected");
+                lv_obj_set_style_text_color(lbl_wifi_status, AMB_LIVE, 0);
+            }
         } else {
+            wifiBarsUpdate(0, false);
             lv_label_set_text(lbl_wifi_status, "Not connected - tap Scan to find networks");
             lv_obj_set_style_text_color(lbl_wifi_status, AMB_TEXT3, 0);
         }

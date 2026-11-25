@@ -22,7 +22,8 @@ every other theme keeps its selection.
 
 ## Clock and screensaver
 
-The panel falls back to a clock when idle. Change the face in
+The panel falls back to a clock when idle and nothing is playing. Starting
+playback returns to the player. Change the face in
 **Settings → Clock → Theme**. Each one supports the optional photo background and
 the weather overlay.
 

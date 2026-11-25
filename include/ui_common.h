@@ -21,9 +21,24 @@
 #define DEFAULT_WIFI_PASSWORD ""
 
 // Firmware version
-#define FIRMWARE_VERSION "2.3.1"
+#define FIRMWARE_VERSION "2.4.0"
+// Where update checks and downloads come from ("owner/repo"). The default is the
+// upstream project, so a stock build offers its newer releases as a toast and a
+// manual install. To follow your own releases, set it in the env build_flags (or
+// a local override): -DGITHUB_REPO=\"owner/repo\"
+#ifndef GITHUB_REPO
 #define GITHUB_REPO "OpenSurface/SonosESP"
+#endif
+// 1 = also accept AUTOMATIC installs from the upstream project. Off by default:
+// an automatic install replaces the whole firmware, so it only runs from a repo
+// the builder chose (see include/auto_update.h and docs/guide/updates.md).
+#ifndef AUTOUPDATE_ALLOW_UPSTREAM
+#define AUTOUPDATE_ALLOW_UPSTREAM 0
+#endif
 #define GITHUB_API_URL "https://api.github.com/repos/" GITHUB_REPO "/releases/latest"
+#include "auto_update.h"
+static constexpr bool kAutoInstallSourceOk =
+    !auto_update::sourceIsUpstream(GITHUB_REPO) || AUTOUPDATE_ALLOW_UPSTREAM;
 
 // Album art configuration
 //
@@ -129,6 +144,7 @@ extern volatile uint32_t night_wake_ms;
 bool nightNow();
 extern int panel_variant;   // PANEL_VARIANT_* — which 7" LCD panel is fitted
 extern bool lyrics_enabled;
+extern bool auto_update_enabled;   // install updates found by the daily check (default on)
 // Amber player theme only: swap the Next-up / lyrics shelf for a clock (#199).
 extern bool amber_shelf_clock;
 // Anonymous install counter (see analytics.h for the full payload). Persisted
@@ -138,6 +154,8 @@ extern bool blur_bg_enabled;
 extern String pending_wifi_ssid;        // issue #85: creds awaiting persistence
 extern String pending_wifi_pass;
 extern volatile bool wifi_creds_need_save;
+// Set while a user Wi-Fi scan or connect runs; checkWiFiReconnect() stands aside.
+extern volatile bool wifi_user_op_in_progress;
 // Written by touchSamplerTask (core 0), read/written by checkAutoDim() on
 // mainAppTask (core 1). volatile so core 1 cannot hold a stale cached value and
 // re-dim the screen under the user's finger immediately after a wake.
@@ -296,6 +314,8 @@ void playbackPositionInit(void);
 // Function Declarations - Event Handlers
 // ============================================================================
 void ev_play(lv_event_t *e);
+void ev_album_tap(lv_event_t *e);       // album art tapped while playing: open Favorites
+void ev_lyrics_toggle(lv_event_t *e);   // "Lyrics on/off" button under the artwork
 void ev_prev(lv_event_t *e);
 void ev_next(lv_event_t *e);
 void ev_shuffle(lv_event_t *e);
@@ -317,6 +337,16 @@ void ev_wifi_connect(lv_event_t *e);
 void ev_check_update(lv_event_t *e);
 void ev_install_update(lv_event_t *e);
 void ev_ota_settings(lv_event_t *e);
+
+// Runs work(arg) on a one-shot internal-stack task, then done(arg) on the LVGL task
+// (done may be NULL). work must not call lv_*. False: nothing was started.
+bool uiOffloadStart(const char* name, uint32_t stack, void (*work)(void*), void (*done)(void*), void* arg);
+// Speaker scan (plus group refresh when with_groups) on its own task; done(count)
+// runs on the LVGL task. False if a scan is already running or the task failed.
+bool speakerScanBusy();
+bool speakerScanStart(bool with_groups, void (*done)(int count));
+// True while a Groups > Add/Remove task runs; the scan buttons refuse meanwhile.
+bool groupEditBusy();
 
 // ============================================================================
 // Function Declarations - Utilities

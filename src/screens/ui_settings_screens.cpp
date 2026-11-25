@@ -4,7 +4,9 @@
  * (Other settings screens have been extracted to separate files)
  */
 
+#include <new>             // std::nothrow for the Browse fetch/play hand-offs
 #include "ui_common.h"
+#include "favorites.h"
 #include "ui_settings_card.h"   // addScreenHeader() - shared title row
 #include "config.h"
 #include "ui_fonts.h"
@@ -296,6 +298,8 @@ static const int SOURCE_META_COUNT = sizeof(SOURCE_META) / sizeof(SOURCE_META[0]
 
 static lv_obj_t* sources_list = nullptr;
 
+static void browsePlayAsync(char kind, const String& uri, const String& meta, const String& title);
+
 // ── Browse navigation trail ─────────────────────────────────────────────────
 // createBrowseScreen() rebuilds the screen for every container and keeps only
 // current_browse_id, so "where did I come from" has to be recorded explicitly or
@@ -313,6 +317,11 @@ static void browseEnterRoot(const String& id, const String& title) {
     current_browse_title = title;
     createBrowseScreen();
     lv_screen_load(scr_browse);
+}
+
+// The player's album art opens the Favorites list (see favorites.h).
+void openFavoritesScreen() {
+    browseEnterRoot("FV:2", "Favorites");
 }
 
 // Descend into a child container, remembering the level being left.
@@ -358,12 +367,16 @@ static void sourceRowDeleteCb(lv_event_t* e) {
 // Inner content width is 800 - SB_RAIL_W(216) - 2*SETTINGS_CONTENT_PAD(24) = 536.
 // Two tiles plus one 10px gap: (536 - 10) / 2 = 263.
 #define SOURCE_TILE_W 263
+static String        s_src_didl;                 // last root listing (UI task only)
+static String        s_src_fresh;                // written by the fetch task
+static volatile bool s_src_fetching = false;
+static volatile bool s_src_ready    = false;
+static uint32_t      s_src_fetched_ms = 0;
 
-static void refreshSourcesList(lv_event_t* e) {
+static void buildSourcesList(const String& didl) {
     if (!sources_list) return;
     lv_obj_clean(sources_list);   // per-row delete cbs free their ObjectIDs
 
-    String didl = sonos.browseContent("0");
     Serial.printf("[SOURCES] root DIDL length=%d\n", didl.length());
 
     int searchPos = 0, shown = 0;
@@ -481,9 +494,16 @@ static void refreshSourcesList(lv_event_t* e) {
         lv_obj_add_event_cb(btn, [](lv_event_t* ev) {
             SonosDevice* d = sonos.getCurrentDevice();
             if (!d) return;
-            String uri = "x-rincon-stream:" + d->rinconID;
+            // rinconID is a String discovery and the polling task write under
+            // deviceMutex. Copy it under the lock; on timeout do not play a
+            // stream URI built from a half-written ID.
+            String rid;
+            if (xSemaphoreTake(sonos.getDeviceMutex(), pdMS_TO_TICKS(50)) != pdTRUE) return;
+            rid = d->rinconID;
+            xSemaphoreGive(sonos.getDeviceMutex());
+            String uri = "x-rincon-stream:" + rid;
             Serial.printf("[SOURCES] Line-In -> %s\n", uri.c_str());
-            sonos.playURI(uri.c_str(), "");
+            browsePlayAsync('L', uri, "", "Line-In");   // SOAP off the LVGL task
             lv_screen_load(scr_main);
         }, LV_EVENT_CLICKED, NULL);
         shown++;
@@ -491,13 +511,65 @@ static void refreshSourcesList(lv_event_t* e) {
 
     if (shown == 0) {
         lv_obj_t* lbl = lv_label_create(sources_list);
-        lv_label_set_text(lbl, sonos.getCurrentDevice()
-                               ? "No sources found"
-                               : "No Sonos device connected");
+        lv_label_set_text(lbl, !sonos.getCurrentDevice() ? "No Sonos device connected"
+                               : s_src_fetching          ? "Loading sources..."
+                                                         : "No sources found");
         lv_obj_set_style_text_color(lbl, AMB_TEXT3, 0);
         lv_obj_set_style_text_font(lbl, &font_text_16, 0);
     }
     Serial.printf("[SOURCES] %d source(s) listed\n", shown);
+}
+
+// ── Opening Sources without freezing the panel ─────────────────────────────────
+// This screen used to run Browse("0") inside its LOAD_START handler, i.e. on the
+// LVGL task. sendSOAP() waits for network_mutex (up to NETWORK_MUTEX_TIMEOUT_MS)
+// and then for the SDIO cooldowns, so opening Sources while the album-art or lyrics
+// task held the radio froze the whole panel - touch included - for seconds. That is
+// the "freezes going to Settings" report: Sources is one tap from General.
+//
+// Now the last listing is drawn at once and a task refreshes it. The poll below
+// swaps the new listing in only when it differs, so a steady list does not flicker.
+//
+// Hand-off order matters. s_src_fresh is owned by the task from start until the
+// poll consumes s_src_ready. The task used to clear s_src_fetching BEFORE setting
+// s_src_ready, so a second open in that window could start another task that
+// overwrote s_src_fresh while the poll was reading it. Now s_src_ready is set
+// first and a new fetch is refused until the poll has consumed it.
+
+static void sourcesFetchTask(void*) {
+    s_src_fresh = sonos.browseContent("0");
+    __sync_synchronize();                        // publish the String before the flag
+    s_src_ready = true;
+    __sync_synchronize();                        // ready is visible before fetching drops
+    s_src_fetching = false;
+    vTaskDelete(NULL);
+}
+
+static void sourcesFetchStart() {
+    if (s_src_fetching || s_src_ready || !sonos.getCurrentDevice()) return;
+    s_src_fetching = true;
+    if (xTaskCreatePinnedToCore(sourcesFetchTask, "SrcFetch", 8192, NULL, 1, NULL, 1) != pdPASS)
+        s_src_fetching = false;
+}
+
+static void refreshSourcesList(lv_event_t* e) {
+    buildSourcesList(s_src_didl);                // instant, from the last visit
+    if (s_src_didl.length() == 0 || (uint32_t)(millis() - s_src_fetched_ms) > 60000UL)
+        sourcesFetchStart();
+}
+
+static void sourcesPoll(lv_timer_t*) {
+    if (!s_src_ready) return;                    // one flag test while idle
+    __sync_synchronize();
+    s_src_ready = false;
+    s_src_fetched_ms = millis();
+    if (s_src_fresh.length() == 0) {             // speaker did not answer: say so instead of "Loading"
+        if (lv_screen_active() == scr_sources && s_src_didl.length() == 0) buildSourcesList(s_src_didl);
+        return;
+    }
+    if (s_src_fresh == s_src_didl) return;
+    s_src_didl = s_src_fresh;
+    if (lv_screen_active() == scr_sources) buildSourcesList(s_src_didl);
 }
 
 void createSourcesScreen() {
@@ -530,6 +602,7 @@ void createSourcesScreen() {
     // for why this is not filled in here at boot.
     sources_list = list;
     lv_obj_add_event_cb(scr_sources, refreshSourcesList, LV_EVENT_SCREEN_LOAD_START, NULL);
+    lv_timer_create(sourcesPoll, 250, nullptr);
 }
 
 // ============================================================================
@@ -567,8 +640,139 @@ static void browseItemDeleteCb(lv_event_t* e) {
 static lv_obj_t* browse_list     = nullptr;   // list being appended to
 static lv_obj_t* browse_more_btn = nullptr;   // the "Load more" row, if shown
 static int       browse_offset   = 0;         // next StartingIndex to request
+static lv_obj_t* browse_loading  = nullptr;   // "Loading..." row while a page is fetched
 
-static int browsePopulate(lv_obj_t* list, int startIndex);
+static int browseRender(lv_obj_t* list, int startIndex, const String& didl);
+
+// ── Fetching pages off the LVGL task ─────────────────────────────────────────
+// browsePopulate() used to call sonos.browseContent() from the click handler, so
+// every Sources tile, every container row and every "Load more" ran a Browse SOAP
+// on the LVGL task: network_mutex wait plus the SDIO cooldowns plus a 2 s timeout
+// and a retry, with touch and drawing stopped the whole time. Same freeze as the
+// Sources list above, one tap further in.
+//
+// Now the screen is built at once with a "Loading..." row, a one-shot task fetches
+// the page and posts the DIDL to a queue, and browsePoll() renders it on the LVGL
+// task. s_br_gen is bumped per screen build, so a page that arrives after the user
+// has moved on is dropped instead of being drawn into the wrong list.
+// id is a String: a ContentDirectory object ID has no length limit, and the old
+// char[128] cut longer ones, so the Browse asked for a different object.
+struct BrowseReq    { String id; int start; uint32_t gen; };
+struct BrowseResult { uint32_t gen; int start; String didl; };
+
+static QueueHandle_t s_br_queue    = nullptr;   // BrowseResult*, created on the LVGL task
+static lv_timer_t*   s_br_timer    = nullptr;
+static volatile int  s_br_inflight = 0;         // fetch tasks not yet posted
+static uint32_t      s_br_gen      = 0;         // LVGL task only
+
+static void browseFetchTask(void* arg) {
+    BrowseReq* req = (BrowseReq*)arg;
+    BrowseResult* res = new (std::nothrow) BrowseResult;
+    if (res) {
+        res->gen   = req->gen;
+        res->start = req->start;
+        res->didl  = sonos.browseContent(req->id.c_str(), req->start, BROWSE_PAGE_SIZE);
+        // Blocks only this task. browsePoll() keeps running while a fetch is in
+        // flight, so the queue drains.
+        xQueueSend(s_br_queue, &res, portMAX_DELAY);
+    }
+    delete req;
+    __sync_synchronize();                       // posted before in-flight drops
+    __sync_fetch_and_sub(&s_br_inflight, 1);
+    vTaskDelete(NULL);
+}
+
+// An empty page on the LVGL task: the UI then says "No items found" rather than
+// sitting on "Loading..." forever when no fetch could be started.
+static void browsePostEmpty(int startIndex, uint32_t gen) {
+    BrowseResult* res = new (std::nothrow) BrowseResult;
+    if (!res) return;
+    res->gen = gen;
+    res->start = startIndex;
+    if (xQueueSend(s_br_queue, &res, 0) != pdTRUE) delete res;
+}
+
+static void browsePoll(lv_timer_t* t) {
+    BrowseResult* res = nullptr;
+    while (s_br_queue && xQueueReceive(s_br_queue, &res, 0) == pdTRUE) {
+        if (res->gen == s_br_gen && browse_list) {
+            if (browse_loading) { lv_obj_delete(browse_loading); browse_loading = nullptr; }
+            browse_offset += browseRender(browse_list, res->start, res->didl);
+        }
+        delete res;
+    }
+    __sync_synchronize();
+    if (s_br_inflight == 0 && uxQueueMessagesWaiting(s_br_queue) == 0) lv_timer_pause(t);
+}
+
+static void browseFetchStart(const String& id, int startIndex, uint32_t gen) {
+    if (!s_br_queue) s_br_queue = xQueueCreate(2, sizeof(BrowseResult*));
+    if (!s_br_queue) return;
+    if (!s_br_timer) s_br_timer = lv_timer_create(browsePoll, 100, nullptr);
+    lv_timer_resume(s_br_timer);
+
+    BrowseReq* req = (s_br_inflight < 2) ? new (std::nothrow) BrowseReq : nullptr;
+    if (!req) {
+        Serial.println("[BROWSE] Fetch refused (busy or out of memory)");
+        browsePostEmpty(startIndex, gen);
+        return;
+    }
+    req->id    = id;
+    req->start = startIndex;
+    req->gen   = gen;
+    __sync_fetch_and_add(&s_br_inflight, 1);
+    if (xTaskCreatePinnedToCore(browseFetchTask, "BrowseFetch", 8192, req, 1, NULL, 1) != pdPASS) {
+        __sync_fetch_and_sub(&s_br_inflight, 1);
+        delete req;
+        Serial.println("[BROWSE] Could not start fetch task");
+        browsePostEmpty(startIndex, gen);
+    }
+}
+
+static void browseAddLoading(lv_obj_t* list) {
+    browse_loading = lv_label_create(list);
+    lv_label_set_text(browse_loading, "Loading...");
+    lv_obj_set_style_text_color(browse_loading, AMB_TEXT3, 0);
+    lv_obj_set_style_text_font(browse_loading, &font_text_16, 0);
+}
+
+// ── Playing from a row off the LVGL task ─────────────────────────────────────
+// The play calls are several SOAP round trips each (RemoveAllTracksFromQueue,
+// AddURIToQueue, SetAVTransportURI, Play), and lastSourceSave() writes NVS. They
+// ran in the row's click handler, so the panel froze between the tap and the
+// player appearing. Same single-flight one-shot task as favorites.cpp playFavTask.
+// kind: 'P' playlist, 'C' container, 'U' URI (all remembered by lastSourceSave),
+// 'L' Line-In (playURI, not remembered, as before).
+struct BrowsePlayReq { char kind; String uri, meta, title; };
+static volatile bool s_br_playing = false;
+
+static void browsePlayTask(void* arg) {
+    BrowsePlayReq* r = (BrowsePlayReq*)arg;
+    bool ok;
+    switch (r->kind) {
+        case 'P': ok = sonos.playPlaylist(r->uri.c_str(), r->title.c_str());  break;
+        case 'C': ok = sonos.playContainer(r->uri.c_str(), r->meta.c_str());  break;
+        default:  ok = sonos.playURI(r->uri.c_str(), r->meta.c_str());        break;
+    }
+    if (ok && r->kind != 'L') lastSourceSave(r->kind, r->uri, r->meta, r->title);
+    delete r;
+    s_br_playing = false;
+    vTaskDelete(NULL);
+}
+
+static void browsePlayAsync(char kind, const String& uri, const String& meta, const String& title) {
+    if (s_br_playing) return;
+    BrowsePlayReq* r = new (std::nothrow) BrowsePlayReq{kind, uri, meta, title};
+    if (!r) return;
+    s_br_playing = true;
+    // Internal-SRAM stack (xTaskCreatePinnedToCore default): lastSourceSave()
+    // touches NVS, which must not run on a PSRAM stack.
+    if (xTaskCreatePinnedToCore(browsePlayTask, "BrowsePlay", 8192, r, 1, NULL, 1) != pdPASS) {
+        delete r;
+        s_br_playing = false;
+        Serial.println("[BROWSE] Could not start playback task");
+    }
+}
 
 // Row icon from the DIDL upnp:class, so an album, a playlist and a radio station
 // no longer all read as a generic folder. Falls back to folder/note for classes
@@ -600,17 +804,20 @@ static String browseTrailText(void) {
 static void browseLoadMore(lv_event_t* e) {
     if (!browse_list) return;
     // Drop the button first so the new rows land at the end of the list, then
-    // browsePopulate() re-adds it if the page came back full.
+    // browseRender() re-adds it if the page came back full.
     if (browse_more_btn) { lv_obj_delete(browse_more_btn); browse_more_btn = nullptr; }
-    browse_offset += browsePopulate(browse_list, browse_offset);
+    if (browse_loading) return;                   // a page is already on its way
+    browseAddLoading(browse_list);
+    browseFetchStart(current_browse_id, browse_offset, s_br_gen);
 }
 
 void createBrowseScreen() {
     // Keep the outgoing screen alive until the new one is fully built. Deleting
-    // it up-front left lv_display_t::act_scr NULL across browsePopulate()'s
-    // Browse SOAP — a 2s timeout plus a 500ms retry, so several seconds with no
-    // active screen. Build first, delete last; the caller loads immediately after.
+    // it up-front left lv_display_t::act_scr NULL while the screen was built.
+    // Build first, delete last; the caller loads immediately after. The page
+    // itself now arrives later through browsePoll().
     lv_obj_t* old_browse = scr_browse;
+    s_br_gen++;                                   // drop pages fetched for the old screen
 
     scr_browse = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(scr_browse, AMB_BG, 0);
@@ -678,19 +885,19 @@ void createBrowseScreen() {
 
     browse_list     = list;
     browse_more_btn = nullptr;
-    browse_offset   = browsePopulate(list, 0);
+    browse_offset   = 0;
+    browseAddLoading(list);
+    browseFetchStart(current_browse_id, 0, s_br_gen);
 
-    // Now the replacement is populated, retire the old screen. Per-row ItemData
+    // Now the replacement is built, retire the old screen. Per-row ItemData
     // is released by browseItemDeleteCb as LVGL tears down the subtree — no
     // manual sweep needed (and the old one walked the wrong node).
     if (old_browse) lv_obj_delete(old_browse);
 }
 
-// Appends one page of rows to `list`, starting at `startIndex`. Returns how many
-// were added, so the caller can advance the offset.
-static int browsePopulate(lv_obj_t* list, int startIndex) {
-    String didl = sonos.browseContent(current_browse_id.c_str(), startIndex, BROWSE_PAGE_SIZE);
-
+// Appends one fetched page of rows to `list`, starting at `startIndex`. Returns
+// how many were added, so the caller can advance the offset. LVGL task only.
+static int browseRender(lv_obj_t* list, int startIndex, const String& didl) {
     Serial.printf("[BROWSE] ID=%s start=%d DIDL length=%d\n",
                   current_browse_id.c_str(), startIndex, didl.length());
 
@@ -824,7 +1031,7 @@ static int browsePopulate(lv_obj_t* list, int startIndex) {
                     // so a raw &amp; here would be re-escaped into &amp;amp;.
                     String title = sonos.decodeHTML(sonos.extractXML(itemXML, "dc:title"));
                     Serial.printf("[BROWSE] Playing playlist: %s (ID: %s)\n", title.c_str(), id.c_str());
-                    sonos.playPlaylist(id.c_str(), title.c_str());
+                    browsePlayAsync('P', id, "", title);
                     lv_screen_load(scr_main);
                 } else {
                     browseDescend(id, sonos.decodeHTML(sonos.extractXML(itemXML, "dc:title")));
@@ -871,7 +1078,7 @@ static int browsePopulate(lv_obj_t* list, int startIndex) {
                     String meta = sonos.extractXML(itemXML, "r:resMD");
                     if (meta.length() == 0) meta = itemXML;   // non-favourite containers
                     Serial.printf("[BROWSE] Playing container: %s\n", uri.c_str());
-                    sonos.playContainer(uri.c_str(), meta.c_str());
+                    browsePlayAsync('C', uri, meta, sonos.decodeHTML(sonos.extractXML(itemXML, "dc:title")));
                     lv_screen_load(scr_main);
                 } else if (uri.length() > 0) {
                     // A favourited RADIO STATION needs r:resMD exactly as a favourited
@@ -892,7 +1099,7 @@ static int browsePopulate(lv_obj_t* list, int startIndex) {
                     String meta  = resMD.length() ? decodeHTMLEntities(resMD) : itemXML;
                     Serial.printf("[BROWSE] Playing URI: %s%s\n", uri.c_str(),
                                   resMD.length() ? "  (with favourite metadata)" : "");
-                    sonos.playURI(uri.c_str(), meta.c_str());
+                    browsePlayAsync('U', uri, meta, sonos.decodeHTML(sonos.extractXML(itemXML, "dc:title")));
                     lv_screen_load(scr_main);
                 } else {
                     Serial.println("[BROWSE] No URI found!");
@@ -933,6 +1140,6 @@ static int browsePopulate(lv_obj_t* list, int startIndex) {
     }
 
     Serial.printf("[BROWSE] +%d rows from %d, free heap: %d bytes\n",
-                  itemCount, startIndex, esp_get_free_heap_size());
+                  itemCount, startIndex, (int)esp_get_free_heap_size());
     return itemCount;
 }

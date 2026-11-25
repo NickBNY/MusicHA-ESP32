@@ -221,6 +221,21 @@ void themeLoad(void) {
                   active_theme, THEME_COUNT);
 }
 
+void themeBuildActive(void) {
+    themeCurrent()->build();
+    // Shared by every layout: touching the album art while music plays opens the
+    // Favorites list. The art widget is a global the builder contract guarantees.
+    if (img_album) {
+        lv_obj_add_flag(img_album, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(img_album, ev_album_tap, LV_EVENT_CLICKED, NULL);
+    }
+    // While art loads img_album is hidden and only the placeholder icon shows.
+    if (art_placeholder) {
+        lv_obj_add_flag(art_placeholder, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(art_placeholder, ev_album_tap, LV_EVENT_CLICKED, NULL);
+    }
+}
+
 void themeSet(uint8_t idx) {
     if (idx >= THEME_COUNT) idx = 0;
     if (idx == active_theme) return;
@@ -243,7 +258,7 @@ void themeSet(uint8_t idx) {
     // dereferences this every tick, so a stale pointer here is a crash.
     btn_lyrics = nullptr;
 
-    themeCurrent()->build();      // reassigns scr_main + every player widget global
+    themeBuildActive();           // reassigns scr_main + every player widget global
 
     // Forget the source-mode latches BEFORE anything reads them again.
     //

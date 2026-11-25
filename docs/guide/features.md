@@ -16,11 +16,11 @@
 - **Synced lyrics** — time-synced from [LRCLIB](https://lrclib.net/), following the track, hiding themselves when there are none, and colour-matched to the artwork. Cued to the millisecond, so a line lands on its beat rather than up to a second late
 - **A progress bar that actually moves** — the speaker only reports its position once a second, and only when asked, so the bar used to advance in steps. The panel now keeps its own clock between readings and interpolates, while still deferring to the speaker: a seek from the Sonos app is picked up within one poll
 - **Accented characters everywhere** — titles, artists, lyrics, menus, dropdowns and the on-screen keyboard all render Latin-1 and Latin Extended-A properly, so Beyoncé, Björk and Sigur Rós look right instead of losing their accents
-- **Weather** — current conditions and a 6-hour forecast from [Open-Meteo](https://open-meteo.com/), no API key needed
+- **Weather** — current conditions and a 6-hour forecast from [Open-Meteo](https://open-meteo.com/), no API key needed. Metric shows °C and km/h; Imperial shows °F and mph
 - **Three player themes and five clock faces** — see [Themes](/guide/themes)
 - **Auto-dim** — configurable idle timeout and dimmed brightness, down to 1% on the 4-inch. While the clock screensaver is showing, a new track no longer lights the screen up
 - **Night hours** — **Settings → Display** sets a window where the panel rests darker, or fully off, with its own touch-wake brightness. The first touch at night brings the screen up without dismissing the clock, so checking the time in the dark does not throw you into the player
-- **Clock screensaver** — takes over when idle, with an optional photo background. The Amber face also shows when a sleep timer will stop the music
+- **Clock screensaver** — takes over when idle, with an optional photo background. It never replaces the player while music is playing, and it closes on its own when playback starts. The Amber face also shows when a sleep timer will stop the music
 - **Battery levels** — Move and Roam show their charge in the Speakers, Groups and Rooms lists and on the player itself, on all three themes: green from 50%, yellow below that, red and blinking under 20%
 
 ## Under it

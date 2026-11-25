@@ -17,11 +17,13 @@
  *   status      224 .. 248
  *   progress    252 .. 268   (hidden until an install runs)
  *   buttons     280 .. 330
- *   footnote    340 .. 364
+ *   auto-update 336 .. 376
  */
 
 #include "ui_common.h"
+#include "config.h"
 #include "ui_settings_card.h"   // addScreenHeader() - shared title row
+
 #include "ui_fonts.h"
 #include "amber_icons.h"
 #include "amber.h"
@@ -269,15 +271,48 @@ void createOTAScreen() {
     lv_obj_center(lbl_install);
     lv_obj_set_hidden(btn_install_update, true);  // Hidden until update available
 
-    // ── Footnote ────────────────────────────────────────────────────────────
-    lv_obj_t* lbl_info = lv_label_create(content);
-    lv_label_set_text(lbl_info,
-        "Stable ships tested releases. Nightly carries the latest test builds.");
-    lv_obj_set_style_text_color(lbl_info, AMB_TEXT3, 0);
-    lv_obj_set_style_text_font(lbl_info, &font_text_12, 0);
-    lv_obj_set_width(lbl_info, lv_pct(100));
-    lv_label_set_long_mode(lbl_info, LV_LABEL_LONG_DOT);
-    lv_obj_set_pos(lbl_info, 0, SY(OTA_FOOT_Y));
+    // ── Auto-update ─────────────────────────────────────────────────────────
+    // On by default. The daily background check (otaBackgroundCheckTick) arms an
+    // install once it finds a newer release on the selected channel; the install
+    // itself waits until the panel has been left alone for AUTOUPDATE_IDLE_MS. It
+    // replaces the old footnote, whose one line of advice now lives in the sub.
+    // A build that points at the upstream project does not install its releases
+    // on its own (kAutoInstallSourceOk, include/ui_common.h); the sub says so
+    // instead of promising an install that will never start.
+    lv_obj_t* card_auto = lv_obj_create(content);
+    lv_obj_set_size(card_auto, lv_pct(100), SY(40));
+    lv_obj_set_pos(card_auto, 0, SY(OTA_FOOT_Y - 4));
+    lv_obj_set_style_bg_opa(card_auto, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_radius(card_auto, 0, 0);
+    lv_obj_set_style_border_width(card_auto, 0, 0);
+    lv_obj_set_style_pad_all(card_auto, 0, 0);
+    lv_obj_set_scrollable(card_auto, false);
+    lv_obj_set_clickable(card_auto, false);
+
+    lv_obj_t* lbl_auto = lv_label_create(card_auto);
+    lv_label_set_text(lbl_auto, "Install updates automatically");
+    lv_obj_set_style_text_font(lbl_auto, &font_text_16, 0);
+    lv_obj_set_style_text_color(lbl_auto, AMB_TEXT, 0);
+    lv_obj_align(lbl_auto, LV_ALIGN_LEFT_MID, 0, SY(-9));
+
+    lv_obj_t* lbl_auto_sub = lv_label_create(card_auto);
+    lv_label_set_text(lbl_auto_sub, kAutoInstallSourceOk
+        ? "Checks daily, installs when idle. Stable = tested releases."
+        : "Off in this build: updates come from the upstream project. See docs.");
+    lv_obj_set_style_text_font(lbl_auto_sub, &font_text_12, 0);
+    lv_obj_set_style_text_color(lbl_auto_sub, AMB_TEXT3, 0);
+    lv_obj_set_width(lbl_auto_sub, lv_pct(78));
+    lv_obj_set_height(lbl_auto_sub, lv_font_get_line_height(&font_text_12));
+    lv_label_set_long_mode(lbl_auto_sub, LV_LABEL_LONG_DOT);
+    lv_obj_align(lbl_auto_sub, LV_ALIGN_LEFT_MID, 0, SY(9));
+
+    lv_obj_t* sw_auto = addSwitch(card_auto, auto_update_enabled);
+    lv_obj_align(sw_auto, LV_ALIGN_RIGHT_MID, 0, 0);
+    lv_obj_add_event_cb(sw_auto, [](lv_event_t* e) {
+        auto_update_enabled = lv_obj_has_state((lv_obj_t*)lv_event_get_target(e), LV_STATE_CHECKED);
+        wifiPrefs.putBool(NVS_KEY_AUTO_UPDATE, auto_update_enabled);
+        Serial.printf("[OTA] Auto-update %s\n", auto_update_enabled ? "on" : "off");
+    }, LV_EVENT_VALUE_CHANGED, NULL);
 
     // Clear the previous check each time the screen opens, so its result cannot
     // be read as current. The first version of this guard tested

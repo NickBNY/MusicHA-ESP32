@@ -169,8 +169,8 @@ void horizonTick(const struct tm* now) {
     lv_label_set_text(hz_icon, wmoGlyph(clock_wx_wmo, false));
     lv_label_set_text_fmt(hz_temp, "%d°", clock_wx_temp);
     lv_label_set_text(hz_cond, wmoCondition(clock_wx_wmo));
-    lv_label_set_text_fmt(hz_detail, "Feels %d° · H %d%% · W %d km/h · UV %d · %s / %s",
-                          clock_wx_apparent, clock_wx_humidity, clock_wx_wind,
+    lv_label_set_text_fmt(hz_detail, "Feels %d° · H %d%% · W %d %s · UV %d · %s / %s",
+                          clock_wx_apparent, clock_wx_humidity, clock_wx_wind, clockWindUnit(),
                           clock_wx_uv, clock_wx_sunrise, clock_wx_sunset);
     (void)unit;
 

@@ -58,9 +58,9 @@
 #define ANALYTICS_RETRY_MS      300000UL
 
 // The ping is the least urgent network user on the device. It waits a fraction
-// of NETWORK_MUTEX_TIMEOUT_MS and gives up, because this runs on mainAppTask
-// and every millisecond it blocks is a millisecond lv_timer_handler() does not
-// run and the touchscreen is dead.
+// of NETWORK_MUTEX_TIMEOUT_MS and gives up. The send runs on its own task
+// (analytics.cpp), so the wait no longer stalls the touchscreen, but a usage
+// counter still should not hold up the radio for the paths that matter.
 #define ANALYTICS_MUTEX_WAIT_MS 500
 
 // Called once per mainAppTask iteration. Cheap no-op until it has fired.

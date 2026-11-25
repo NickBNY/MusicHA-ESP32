@@ -22,7 +22,7 @@
 // Entry point: hands off to the active theme's builder (see ui_theme.cpp).
 // Each builder is responsible for creating scr_main and every player widget global.
 void createMainScreen() {
-    themeCurrent()->build();
+    themeBuildActive();
 }
 
 // Header buttons were bare icons on a transparent hit box: nothing showed where

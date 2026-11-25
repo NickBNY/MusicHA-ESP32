@@ -17,8 +17,15 @@
 #include "reboot_log.h"
 #include <time.h>
 
+// The lyrics and shelf-clock switches. File scope so the screen-load handler can
+// bring them back in line when "Lyrics on/off" on the player changed the setting.
+static lv_obj_t* sw_lyrics;
+static lv_obj_t* sw_clock;
+
 // Forward declaration (defined in ui_sidebar.cpp)
 lv_obj_t* createSettingsSidebar(lv_obj_t* screen, int activeIdx);
+void addHomeAssistantCard(lv_obj_t* content);   // ui_homeassistant_card.cpp
+void homeAssistantCardRefresh();
 extern bool clock_12h;   // defined with the clock settings; declared here like the sidebar
 
 // ── Recent restarts (reboot_log.h) ──────────────────────────────────────────
@@ -106,8 +113,6 @@ void createGeneralScreen() {
         // File-scope so each callback can clear the other's switch. Reassigned
         // every time this screen is built, and the callbacks only ever fire
         // from the live one, so they cannot outlive their widgets.
-        static lv_obj_t* sw_lyrics;
-        static lv_obj_t* sw_clock;
 
         // Guards the cross-clear below. lv_obj_remove_state() should not re-emit
         // VALUE_CHANGED — in LVGL that is raised from the CLICKED path, not from
@@ -342,6 +347,8 @@ void createGeneralScreen() {
         s_rb_empty = addDescLabel(list, "Nothing recorded yet.");
     }
 
+    addHomeAssistantCard(content);
+
     // ────────────────────────────────────────────────────────────────────────
     // CARD — Anonymous stats   (last on the screen, deliberately)
     //
@@ -374,7 +381,19 @@ void createGeneralScreen() {
     }
 
     // Refilled on every visit - see refreshRebootList().
-    lv_obj_add_event_cb(scr_general, [](lv_event_t*) { refreshRebootList(); },
-                        LV_EVENT_SCREEN_LOAD_START, NULL);
+    lv_obj_add_event_cb(scr_general, [](lv_event_t*) {
+        refreshRebootList();
+        homeAssistantCardRefresh();
+        // lv_obj_add/remove_state do not raise VALUE_CHANGED, so this cannot loop
+        // back into the switches' own handlers.
+        if (sw_lyrics) {
+            if (lyrics_enabled) lv_obj_add_state(sw_lyrics, LV_STATE_CHECKED);
+            else                lv_obj_remove_state(sw_lyrics, LV_STATE_CHECKED);
+        }
+        if (sw_clock) {
+            if (amber_shelf_clock) lv_obj_add_state(sw_clock, LV_STATE_CHECKED);
+            else                   lv_obj_remove_state(sw_clock, LV_STATE_CHECKED);
+        }
+    }, LV_EVENT_SCREEN_LOAD_START, NULL);
     refreshRebootList();
 }

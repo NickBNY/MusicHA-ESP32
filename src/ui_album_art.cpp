@@ -25,6 +25,7 @@
 
 // ESP32-P4 Hardware JPEG Decoder
 #include "driver/jpeg_decode.h"
+#include "esphome_api.h"
 static jpeg_decoder_handle_t hw_jpeg_decoder = nullptr;
 
 // stb_image full progressive JPEG decoder (defined in stb_jpeg.cpp)
@@ -737,7 +738,7 @@ static DecodeResult decodeToRGB565(uint8_t* buf, size_t len, bool isJPEG, bool i
                                     }
                                 }
                                 if (hw_ret2 == ESP_OK) {
-                                    Serial.printf("[ART] HW decoded: %u bytes\n", out_size);
+                                    Serial.printf("[ART] HW decoded: %u bytes\n", (unsigned)out_size);
                                     decoded_pixels   = (uint16_t*)hw_out_buf;
                                     final_w          = w;
                                     final_h          = h;
@@ -1311,6 +1312,7 @@ void albumArtTask(void* param) {
                         continue;
                     }
                     dma_fail_count++;
+                    haNoteArtDmaAbort();   // Home Assistant debug counter, no-op while off
                     size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_DMA);
                     Serial.printf("[ART] DMA too low (%u < %u, largest=%uKB) — abort #%d\n",
                                   (unsigned)dma_snap, (unsigned)ART_MIN_DMA_PRE_BURST,

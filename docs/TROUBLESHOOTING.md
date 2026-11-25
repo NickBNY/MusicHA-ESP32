@@ -2,7 +2,7 @@
 
 Common problems and how to fix them. If none of this helps, [open an issue](https://github.com/OpenSurface/SonosESP/issues) — and please include the [serial log](#how-to-get-a-serial-log), it usually identifies the cause immediately.
 
-**Jump to:** [Computer can't see the device](#the-computer-cant-see-the-device) · [Updates fail](#updates-fail-or-stop-partway) · [Blank screen](#blank-screen-after-an-update) · [Wi-Fi](#wi-fi-wont-connect) · [No speakers](#no-sonos-speakers-found) · [Album art](#album-art-doesnt-appear) · [Lyrics](#lyrics-dont-appear) · [Screen flickers](#the-screen-flickers-during-an-update) · [Full reset](#start-completely-fresh) · [Serial log](#how-to-get-a-serial-log)
+**Jump to:** [Computer can't see the device](#the-computer-cant-see-the-device) · [Updates fail](#updates-fail-or-stop-partway) · [Blank screen](#blank-screen-after-an-update) · [Wi-Fi](#wi-fi-wont-connect) · [No speakers](#no-sonos-speakers-found) · [Album art](#album-art-doesnt-appear) · [Lyrics](#lyrics-dont-appear) · [Screen flickers](#the-screen-flickers-during-an-update) · [Restarted on its own](#the-panel-restarted-on-its-own) · [Panel battery](#the-panels-own-battery) · [Full reset](#start-completely-fresh) · [Serial log](#how-to-get-a-serial-log)
 
 ---
 
@@ -149,6 +149,17 @@ rather than mixing parts.
 OTA keeps the two apart automatically: a rev3 unit asks for
 `firmware-4inch-r3.bin` and will not accept the pre-rev3 asset.
 
+The first release to carry `firmware-4inch-r3.bin` was the nightly
+`v2.3.2-nightly.5a1626c`. The Stable release v2.3.1 has no rev3 asset, so a
+rev3 unit on the Stable channel reports *"v… available, no build for this
+screen"* until the next Stable release ships one. That message is the safety
+check working, not a fault. Auto-update follows the same rule: it never
+installs an image without the rev3 asset name.
+
+The 7" has no rev3 build yet. Its panel driver carries the same rev3 clock fix
+as the 4", but nobody has a rev3 7" to test it on, so there is no
+`esp32_7inch_r3` environment and no 7" rev3 asset.
+
 **Do not hand-install the wrong one.** It is not refused and it does not roll
 back by itself — recovery is a cable reinstall of the correct build.
 
@@ -188,6 +199,12 @@ access point it heard, which on a mesh is whichever node answered quickest, not
 the best one — a panel in a far room could sit on a distant node while a strong
 one was in the next room. This costs about a second on connect.
 
+To check the link, open **Settings → WiFi**. The status card shows four signal
+bars and the figure in dBm, refreshed every 5 seconds while that screen is
+open. Four bars is above -60 dBm, three is -60 to -67, two is -67 to -75, and
+one dim bar is below -75. One bar is weak enough to explain dropped artwork
+and slow updates.
+
 ### The Wi-Fi co-processor, and the version warning
 
 The ESP32-P4 has no radio of its own. Wi-Fi runs on a second chip, an
@@ -198,9 +215,24 @@ The two halves can be different versions. Boards ship with whatever C6 firmware
 was flashed at the factory, and the host half is built into SonosESP. Measured
 on a current board: the C6 reports **2.3.0**, the host is **2.12.3**.
 
-**That gap is normal, and on its own it is not a fault.** It has been present on
-every SonosESP release so far and Wi-Fi works. Do not go looking for it as the
-explanation for an unrelated problem.
+**The gap is present on every SonosESP release so far, and Wi-Fi works on most
+panels with it.** It does not explain a weak signal, and it is not a reason to
+reflash the C6 when something unrelated is wrong.
+
+It can explain **drops**. Community measurements on the same 4" board
+([#196](https://github.com/OpenSurface/SonosESP/issues/196),
+[field notes](https://github.com/ultramcu/guition-jc4880p443c-i-w)) found:
+
+- some boards ship the C6 with **2.3.2**, not 2.3.0;
+- on a 2.3.x C6, the first association failed with `reason=8 ASSOC_LEAVE` and
+  only a retry about 20 seconds later succeeded, and the host logged
+  `Dropping packet(s) from stream` on the Wi-Fi link;
+- after the C6 was moved to **2.12.x**, the same board associated on the first
+  try and showed no disconnects over the test period, at the same signal level.
+
+So if your panel connects, then drops Wi-Fi again within minutes, the C6
+version is a plausible cause. The SonosESP maintainers have not reproduced or
+tested that fix themselves.
 
 You will not see it in a normal serial log. The host reports it like this —
 
@@ -218,6 +250,17 @@ the co-processor firmware incorrectly can leave a board with no Wi-Fi at all,
 so this page will not guess at the steps. If you have a genuine link problem,
 a serial log is far more useful than a co-processor reflash.
 
+Owners who accept that risk have documented two routes for the 4" board, both
+outside SonosESP and at your own risk: a wired UART flash of the C6 through the
+board's expansion header
+([field notes](https://github.com/ultramcu/guition-jc4880p443c-i-w), section 1),
+and an over-SDIO update pushed by a separate P4 program before any Wi-Fi
+association
+([#196](https://github.com/OpenSurface/SonosESP/issues/196)). The C6 image that
+matches the host in SonosESP is `esp32c6-v2.12.3.bin`, which PlatformIO
+installs under `framework-arduinoespressif32-libs/hosted/`. The C6 keeps its
+firmware in its own flash, so reflashing SonosESP afterwards does not undo it.
+
 ---
 
 ## No Sonos speakers found
@@ -227,6 +270,11 @@ a serial log is far more useful than a co-processor reflash.
 3. Go to **Settings → Speakers → Scan** and allow a few seconds
 4. Check **AP isolation / client isolation** is off on your router — this silently blocks device-to-device traffic
 5. Confirm the Sonos app on your phone sees the speakers from the same network
+
+The panel also looks by itself: it refreshes the speaker list after boot and
+every 4 hours once the screen has been idle for a few seconds, and when it
+knows no speakers at all it scans again every 10 minutes. A speaker that was
+switched off during the first scan therefore appears without pressing Scan.
 
 ---
 
@@ -241,7 +289,7 @@ a serial log is far more useful than a co-processor reflash.
 
 ## Lyrics don't appear
 
-- Enable them in **Settings → General → Show synced lyrics**
+- Enable them in **Settings → General → Show synced lyrics**, or with **Lyrics on/off** under the artwork in the Amber player. Both change the same setting
 - Lyrics come from [LRCLIB](https://lrclib.net/) and **only time-synced lyrics are shown**. Many tracks have none — this is the usual reason.
 - Matching relies on the artist/title reported by Sonos; live or remastered titles often fail to match
 - Radio and TV/line-in sources have no lyrics
@@ -284,6 +332,68 @@ Since v2.0.6 the panel keeps a record. **Settings → General → Device → Rec
 Everything else — **You restarted it**, **Firmware update**, **Powered on**, **USB connected** and the like — is expected. **USB connected** is what opening a serial monitor looks like.
 
 If gold entries keep appearing, [open an issue](https://github.com/OpenSurface/SonosESP/issues) with a photo of the list and, if you can, a serial log from the next boot.
+
+### Crashed, with task `sdio_read` or `sdio_rx_buf`
+
+If the coredump summary in the serial log looks like this:
+
+```
+[COREDUMP]   task   : sdio_rx_buf        (or sdio_read)
+[COREDUMP]   PC     : 0x4FF1xxxx
+[COREDUMP]   mcause : 0x00000002   mtval : 0x00000000
+```
+
+it is a **known crash in the Wi-Fi co-processor driver**, not in SonosESP's own
+code ([#200](https://github.com/OpenSurface/SonosESP/issues/200),
+[#208](https://github.com/OpenSurface/SonosESP/issues/208)). `mcause 0x2` is an
+illegal instruction, which is how a failed assert ends on this chip, and a PC
+in `0x4FF1xxxx` is internal RAM, where the precompiled ESP-Hosted driver runs.
+The assert fires when the driver's receive buffer pool runs out. Reports so far
+came after 3.5 hours and after 1 day 20 hours of uptime, on both the 4" and
+the 7".
+
+**There is no fix in current releases.** SonosESP ships ESP-Hosted **2.12.3**
+inside the precompiled Arduino libraries. Upstream **2.12.13** replaced that
+assert with a log-and-drop, and it can only arrive with a newer Arduino core,
+which has not been tested on these panels yet. The firmware already spaces out
+its network traffic to keep that buffer pool from running dry (the cooldowns in
+`src/ui_network_guard.cpp`), which makes the crash rarer but cannot remove it.
+
+What happens when it fires: the panel restarts by itself, records **Crashed**
+in Recent restarts, and reconnects to the remembered speaker, in about
+40 seconds in the #200 log. You do not need to do anything.
+
+What helps the report:
+
+- the `[COREDUMP]` lines from the next boot, and the firmware version;
+- the `build :` value on that line, which identifies the exact firmware image;
+- the Wi-Fi signal from **Settings → WiFi**;
+- whether the C6 has ever been updated (see
+  [the co-processor section](#the-wi-fi-co-processor-and-the-version-warning)).
+
+---
+
+## The panel's own battery
+
+The battery levels SonosESP shows belong to **Sonos portables** (Move, Roam),
+read from the speaker over the network. The panel cannot show the charge of a
+LiPo attached to the panel itself
+([#213](https://github.com/OpenSurface/SonosESP/issues/213)).
+
+On the 4" board (JC4880P443C) the battery connector feeds an **IP5306**
+charger and boost chip. In the vendor schematic, sheet 02, none of its pins
+reach the ESP32-P4: the battery line has no voltage divider to an ADC input,
+the charge-state pins (`LED1` to `LED3`) and `KEY` are not connected to
+any P4 GPIO, and no I²C lines run to the chip. The firmware therefore has
+nothing to read. We have not found a published schematic for the 7" board
+(JC1060P470C).
+
+Two ways to see the charge today:
+
+- the IP5306's own LEDs, where your board has them fitted;
+- a hardware change: a resistor divider from `BAT+` to a free P4 ADC pin on the
+  expansion header. If you build one, open an issue with the pin and resistor
+  values and the firmware side can be added.
 
 ---
 

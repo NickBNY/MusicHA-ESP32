@@ -283,7 +283,9 @@ void clockRequestWeatherRefresh();
 
 extern bool clock_weather_enabled;   // true = show weather widget
 extern int  clock_weather_city_idx;  // Index into CLOCK_CITIES[], OR == CLOCK_CITY_COUNT for custom location (issue #74)
-extern bool clock_wx_fahrenheit;     // true = display temps in °F
+extern bool clock_wx_fahrenheit;     // true = imperial: temps in °F and wind in mph
+// Wind speed unit follows the temperature unit: Imperial pairs °F with mph.
+inline const char* clockWindUnit() { return clock_wx_fahrenheit ? "mph" : "km/h"; }
 
 // Custom location override (issue #74) — used when clock_weather_city_idx == CLOCK_LOC_CUSTOM_IDX.
 // Stored as `volatile float` (32-bit aligned = atomic single-word read on RISC-V) so the bg task
@@ -302,7 +304,7 @@ extern char clock_custom_name[64];
 struct ClockWxHour { int wmo; int temp; int hour; };  // hour 0-23
 extern int            clock_wx_temp;          // Current temperature °C
 extern int            clock_wx_humidity;      // Current humidity %
-extern int            clock_wx_wind;          // Current wind speed km/h
+extern int            clock_wx_wind;          // Current wind speed, in clockWindUnit()
 extern int            clock_wx_wmo;           // Current WMO weather code
 extern ClockWxHour    clock_wx_hourly[6];     // Next 6 hours forecast
 extern char          clock_wx_city_name[64]; // Display city name (from ip-api or ClockCity label)

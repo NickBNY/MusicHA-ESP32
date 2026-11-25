@@ -44,6 +44,7 @@ enum Cause : uint8_t {
     CAUSE_DMA_RECONNECT,  // DMA low again after the Wi-Fi reconnect recovery
     CAUSE_WIFI_TIMEOUT,   // Wi-Fi did not come back during that recovery
     CAUSE_DMA_WIFI_STOP,  // DMA still low even with Wi-Fi stopped
+    CAUSE_LOW_MEMORY,     // the daily memory check found the heap exhausted
 };
 
 constexpr uint32_t UPTIME_UNKNOWN  = 0xFFFFFFFFu;
@@ -157,6 +158,7 @@ inline const char* label(const Entry& en) {
             case CAUSE_DMA_RECONNECT: return "Low memory after reconnect";
             case CAUSE_WIFI_TIMEOUT:  return "Wi-Fi did not reconnect";
             case CAUSE_DMA_WIFI_STOP: return "Low memory (self-restart)";
+            case CAUSE_LOW_MEMORY:    return "Low memory (daily check)";
             default:                  return "Restarted";
         }
     }
@@ -185,7 +187,8 @@ inline bool unexpected(const Entry& en) {
             return true;
         case RST_SW:
             return en.cause == CAUSE_DMA_RECONNECT || en.cause == CAUSE_WIFI_TIMEOUT ||
-                   en.cause == CAUSE_DMA_WIFI_STOP || en.cause == CAUSE_OTA_FAILED;
+                   en.cause == CAUSE_DMA_WIFI_STOP || en.cause == CAUSE_OTA_FAILED ||
+                   en.cause == CAUSE_LOW_MEMORY;
         default:
             return false;
     }

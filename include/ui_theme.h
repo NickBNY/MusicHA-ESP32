@@ -109,6 +109,9 @@ void themeMigrate(void);
 // Persists + applies the index. Rebuilds the player screen when it changes.
 // Must be called from the main LVGL thread (settings callbacks qualify).
 void themeSet(uint8_t idx);
+// Builds the active theme's player and attaches what every theme shares (the album
+// art opens Favorites). Use this, not themeCurrent()->build().
+void themeBuildActive(void);
 
 // True when the current theme wants the blurred-art image as its backdrop.
 // Gates the blur bg upload in displayCompletedArt().

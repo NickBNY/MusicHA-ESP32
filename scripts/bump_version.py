@@ -27,6 +27,10 @@ VERSION_FILES = {
         'type': 'json',
         'key': 'version'
     },
+    'web-installer/manifest-4inch-r3.json': {  # 4" on ESP32-P4 rev 3.x silicon (#203)
+        'type': 'json',
+        'key': 'version'
+    },
     'web-installer/manifest-7inch.json': {     # canonical 7" (placeholder until firmware exists)
         'type': 'json',
         'key': 'version'

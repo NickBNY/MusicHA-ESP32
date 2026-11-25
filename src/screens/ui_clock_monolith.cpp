@@ -177,7 +177,7 @@ void monolithTick(const struct tm* now) {
                           wmoCondition(clock_wx_wmo), clock_wx_apparent);
 
     lv_label_set_text_fmt(ml_val[0], "%d%%",     clock_wx_humidity);
-    lv_label_set_text_fmt(ml_val[1], "%d km/h",  clock_wx_wind);
+    lv_label_set_text_fmt(ml_val[1], "%d %s", clock_wx_wind, clockWindUnit());
     lv_label_set_text_fmt(ml_val[2], "%d",       clock_wx_uv);
     lv_label_set_text_fmt(ml_val[3], "%s-%s",    clock_wx_sunrise, clock_wx_sunset);
 

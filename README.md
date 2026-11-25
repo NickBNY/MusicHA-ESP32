@@ -34,25 +34,27 @@ A wall-mount or desktop remote for Sonos speakers: album art, synced lyrics, ful
 - **Complete library browsing** — every source the speaker exposes, not a fixed list. See [Music sources](#music-sources)
 - **Multi-room** — switch between Sonos zones, with live indicators showing which rooms are playing
 - **Speaker groups** — create and break groups from the panel
+- **Remembers your speakers** — the last room or group you picked is stored on the panel and restored at boot. The speaker list refreshes itself after boot and every 4 hours, only while the panel is idle, and a panel that knows no speakers scans again every 10 minutes
+- **Favorites on the player** — the Amber player shows your top 6 Sonos Favorites under Play/Pause, and tapping the album art opens the full Favorites list
 - **Line-in and TV audio** — dedicated screens when a soundbar is on TV input or a device is on analogue line-in
 - **Sleep timer** — the Sleep button at the bottom of the Amber player stops the music after 15 to 90 minutes, with +15 and Turn off. It sets the speaker's own timer, so one set by voice or in the Sonos app shows on the panel too
 
 ### Display
 
 - **Album art** — ESP32-P4 hardware JPEG decoder, with PNG and progressive-JPEG support, bilinear scaling and automatic dominant-colour extraction
-- **Synced lyrics** — time-synced from [LRCLIB](https://lrclib.net/), with auto-hide and colour matching
+- **Synced lyrics** — time-synced from [LRCLIB](https://lrclib.net/), with auto-hide and colour matching. The **Lyrics on/off** button under the artwork in the Amber player switches them without opening Settings
 - **Accented characters throughout** — titles, artists, lyrics, menus, dropdowns and the on-screen keyboard all render Latin-1 and Latin Extended-A correctly (Beyoncé, Björk, Sigur Rós) rather than substituting plain letters
 - **Three player themes** and **five screensaver faces** — see below
 - **Queue and Rooms as overlays** — both open over the player instead of replacing it, so the transport stays reachable
 - **Per-speaker volume** — adjust the selected room from the Speakers list or the Rooms overlay
 - **Battery levels** — Move and Roam show their charge in the Speakers, Groups and Rooms lists and at the bottom of the Amber player: green from 50%, yellow below that, red and blinking under 20%
-- **Weather** — current conditions and a 6-hour forecast from [Open-Meteo](https://open-meteo.com/), no API key
+- **Weather** — current conditions and a 6-hour forecast from [Open-Meteo](https://open-meteo.com/), no API key. The Imperial setting shows °F with wind in mph; Metric shows °C with km/h
 - **Auto-dim** — configurable idle timeout and dimmed brightness, down to 1% on the 4″. While the clock screensaver is up, a new track no longer lights the screen
 
 ### System
 
 - **Two panel sizes, one codebase** — 4″ and 7″ build from the same source, with type and spacing scaling to the panel rather than being authored twice
-- **OTA updates** — install new firmware from the panel, on Stable or Nightly channels, with resumable downloads
+- **OTA updates** — install new firmware from the panel, on Stable or Nightly channels, with resumable downloads. **Auto-update** is on by default: the panel checks once a day and installs a newer **Stable** release after it has been idle for 5 minutes. On the Nightly channel it still checks and offers the update, but you install it yourself. Switch it off under **Settings → Update → Install updates automatically**
 - **Browser installer** — flash over USB from Chrome, Edge or Opera; no toolchain required
 - **Restart history** — **Settings → General** lists the last eight restarts and why each happened, so a panel that restarted overnight can say why. See [Troubleshooting](docs/TROUBLESHOOTING.md#the-panel-restarted-on-its-own)
 
@@ -100,7 +102,8 @@ Switch in **Settings → General → Theme**. Adding one is a single registry en
 
 ## Screensaver themes
 
-The panel falls back to a clock after an idle timeout. Switch faces in
+The panel falls back to a clock after an idle timeout, but never while music is
+playing; starting playback returns to the player. Switch faces in
 **Settings → Clock → Theme**; each supports the optional photo background and the
 weather overlay. Adding one is a single registry entry — see
 [`src/clock_face.cpp`](src/clock_face.cpp).

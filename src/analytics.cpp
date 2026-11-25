@@ -10,7 +10,6 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
-#include <esp_task_wdt.h>   // the bracket below; not relied on transitively
 
 // One shot per boot, but spent on a real attempt rather than on reaching this
 // function. The first version set it at the top, which meant a panel that was
@@ -25,6 +24,10 @@
 static bool     s_analytics_done = false;
 static uint8_t  s_tries          = 0;
 static uint32_t s_next_try_ms    = 0;
+// Set while analyticsSendTask runs; analyticsTick() stays out until it ends.
+// The task writes s_analytics_done / s_tries / s_next_try_ms and clears this
+// after a barrier, so mainAppTask reads them only once the task is done.
+static volatile bool s_busy = false;
 
 // Back off and come back, unless the budget is gone.
 static void analyticsRetryLater(const char* why) {
@@ -38,7 +41,10 @@ static void analyticsRetryLater(const char* why) {
                   ANALYTICS_MAX_TRIES - 1, ANALYTICS_RETRY_MS / 1000UL);
 }
 
+static void analyticsSendTask(void*);
+
 void analyticsTick() {
+    if (s_busy) return;
     if (s_analytics_done) return;
     if (millis() < ANALYTICS_BOOT_DELAY_MS) return;
     if (s_next_try_ms && (int32_t)(millis() - s_next_try_ms) < 0) return;
@@ -67,11 +73,11 @@ void analyticsTick() {
     //
     // This matters more than it looks. sdioPreWait() enforces its cooldowns
     // with vTaskDelay - up to 200ms general + 3000ms HTTPS + 3000ms
-    // inter-download = 6.2s - and we are on mainAppTask, so every one of those
-    // milliseconds is a millisecond lv_timer_handler() does not run and the
-    // touchscreen is dead. A retry budget that pays 6.2s per attempt would turn
-    // one stall into twelve. Mirroring the guard's own conditions here makes a
-    // deferral cost microseconds, which is what makes the budget affordable.
+    // inter-download = 6.2s. The send now runs on its own task, so those waits
+    // no longer stall lv_timer_handler(), but a retry budget that pays 6.2s per
+    // attempt would still turn one stall into twelve. Mirroring the guard's own
+    // conditions here, on mainAppTask, makes a deferral cost microseconds, which
+    // is what makes the budget affordable.
     const unsigned long now = millis();
     const bool radio_busy =
         art_download_in_progress ||
@@ -83,6 +89,17 @@ void analyticsTick() {
         return;
     }
 
+    // The TLS GET runs on a one-shot internal-stack task. On mainAppTask it held
+    // the LVGL task for up to ~27 s (sdioPreWait 6.2 s, mutex 5 s, connect 8 s,
+    // read 8 s) with the watchdog unsubscribed, and ran TLS on its 8 KB stack.
+    s_busy = true;
+    if (xTaskCreatePinnedToCore(analyticsSendTask, "Stats", 8192, NULL, 1, NULL, 1) != pdPASS) {
+        s_busy = false;
+        analyticsRetryLater("no task");
+    }
+}
+
+static void analyticsSendTask(void*) {
     // Now a near-no-op, but still called: it is the documented envelope every
     // network path goes through, and skipping it is what caused #182. The
     // false branch is unreachable (sdioPreWait only returns false from its
@@ -90,12 +107,18 @@ void analyticsTick() {
     // contract still holds if one is ever added.
     if (!sdioPreWait("STATS", SDIO_WAIT_HTTPS_COOLDOWN)) {
         analyticsRetryLater("SDIO busy");
+        __sync_synchronize();
+        s_busy = false;
+        vTaskDelete(NULL);
         return;
     }
 
     if (!network_mutex ||
         xSemaphoreTake(network_mutex, pdMS_TO_TICKS(ANALYTICS_MUTEX_WAIT_MS)) != pdTRUE) {
         analyticsRetryLater("network busy");
+        __sync_synchronize();
+        s_busy = false;
+        vTaskDelete(NULL);
         return;
     }
 
@@ -116,14 +139,6 @@ void analyticsTick() {
     http.setTimeout(8000);
     http.setConnectTimeout(8000);
 
-    // Same watchdog bracket as the background update check, same reason.
-    // Worst case here is sdioPreWait 6.2s + mutex 5s + connect 8s + read 8s,
-    // which is ~27s against a 30s WATCHDOG_TIMEOUT_SEC — under it, but three
-    // seconds of margin is not a margin. This runs once per boot on
-    // mainAppTask, the only WDT-subscribed task, which feeds the dog once per
-    // loop iteration and gets no chance to while this blocks.
-    esp_task_wdt_delete(NULL);
-
     if (http.begin(client, url)) {
         // Identifies the fleet in the dashboard's browser column, and keeps the
         // request from being filtered as an unknown bot. No device identifier.
@@ -142,5 +157,7 @@ void analyticsTick() {
     last_https_end_ms   = millis();
     xSemaphoreGive(network_mutex);
 
-    esp_task_wdt_add(NULL);   // re-subscribe; every path above reaches here
+    __sync_synchronize();
+    s_busy = false;
+    vTaskDelete(NULL);
 }

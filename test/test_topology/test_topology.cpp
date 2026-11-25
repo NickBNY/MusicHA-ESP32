@@ -12,6 +12,7 @@
 #include <unity.h>
 #include <string.h>
 #include <string>
+#include <vector>
 #include "sonos_topology.h"
 
 using namespace sonos_topology;
@@ -279,6 +280,117 @@ void test_respects_buffer_limits(void) {
     TEST_ASSERT_TRUE(g[0].memberCount <= 8);
 }
 
+
+// ---------------------------------------------------------------------------
+// parseMembers — hidden rooms (#211) and the speaker refresh
+// ---------------------------------------------------------------------------
+static std::string sv(const Slice& s) { return s.ptr ? std::string(s.ptr, s.len) : std::string(); }
+
+// A Beam with a bonded Sub (a Satellite child) beside a stereo pair whose second
+// speaker is Invisible, and a standalone room. Entity-decoded, case kept.
+static const char* HIDDEN_FIXTURE =
+    "<ZoneGroups>"
+    "<ZoneGroup Coordinator=\"RINCON_BEAM01400\" ID=\"RINCON_BEAM01400:1\">"
+    "<ZoneGroupMember UUID=\"RINCON_BEAM01400\" Location=\"http://192.168.1.20:1400/xml/device_description.xml\" ZoneName=\"Living Room\">"
+    "<Satellite UUID=\"RINCON_SUB01400\" Location=\"http://192.168.1.21:1400/xml/device_description.xml\" ZoneName=\"Living Room\"/>"
+    "</ZoneGroupMember>"
+    "</ZoneGroup>"
+    "<ZoneGroup Coordinator=\"RINCON_L01400\" ID=\"RINCON_L01400:2\">"
+    "<ZoneGroupMember UUID=\"RINCON_L01400\" Location=\"http://192.168.1.30:1400/xml/device_description.xml\" ZoneName=\"Office\"/>"
+    "<ZoneGroupMember UUID=\"RINCON_R01400\" Location=\"http://192.168.1.31:1400/xml/device_description.xml\" ZoneName=\"Office\" Invisible=\"1\"/>"
+    "</ZoneGroup>"
+    "<ZoneGroup Coordinator=\"RINCON_K01400\" ID=\"RINCON_K01400:3\">"
+    "<ZoneGroupMember UUID=\"RINCON_K01400\" Location=\"http://192.168.1.40:1400/xml/device_description.xml\" ZoneName=\"Kitchen\" Invisible=\"0\"/>"
+    "</ZoneGroup>"
+    "</ZoneGroups>";
+
+void test_members_flag_satellites_and_invisible(void) {
+    Member m[16];
+    int n = parseMembers(HIDDEN_FIXTURE, strlen(HIDDEN_FIXTURE), m, 16);
+    TEST_ASSERT_EQUAL_INT(5, n);
+    TEST_ASSERT_FALSE(m[0].hidden);                       // Beam
+    TEST_ASSERT_TRUE(m[1].hidden);                        // its Sub (Satellite)
+    TEST_ASSERT_FALSE(m[2].hidden);                       // Office left
+    TEST_ASSERT_TRUE(m[3].hidden);                        // Office right (Invisible="1")
+    TEST_ASSERT_FALSE(m[4].hidden);                       // Invisible="0" is visible
+    TEST_ASSERT_TRUE(isHidden(m, n, "rincon_sub01400", 15));   // case-blind lookup
+    TEST_ASSERT_FALSE(isHidden(m, n, "RINCON_BEAM01400", 16));
+}
+
+void test_members_read_name_and_address(void) {
+    Member m[16];
+    int n = parseMembers(HIDDEN_FIXTURE, strlen(HIDDEN_FIXTURE), m, 16);
+    TEST_ASSERT_TRUE(n >= 3);
+    TEST_ASSERT_EQUAL_STRING("Living Room", sv(m[0].name).c_str());
+    TEST_ASSERT_EQUAL_STRING("RINCON_L01400", sv(m[2].uuid).c_str());
+    char host[24];
+    TEST_ASSERT_TRUE(locationHost(m[2].location, host, sizeof(host)));
+    TEST_ASSERT_EQUAL_STRING("192.168.1.30", host);
+}
+
+// The same document after the group parser's lowercase pass: names are lost to
+// case, but the hidden flags and uuids must still resolve.
+void test_members_work_on_lowercased_buffer(void) {
+    std::string lower(HIDDEN_FIXTURE);
+    for (auto& c : lower) if (c >= 'A' && c <= 'Z') c += 32;
+    Member m[16];
+    int n = parseMembers(lower.c_str(), lower.size(), m, 16);
+    TEST_ASSERT_EQUAL_INT(5, n);
+    TEST_ASSERT_TRUE(isHidden(m, n, "RINCON_SUB01400", 15));
+    TEST_ASSERT_TRUE(isHidden(m, n, "RINCON_R01400", 13));
+    TEST_ASSERT_FALSE(isHidden(m, n, "RINCON_K01400", 13));
+}
+
+void test_members_decode_keeps_case(void) {
+    std::string enc = "&lt;ZoneGroupMember UUID=&quot;RINCON_A1400&quot; ZoneName=&quot;Caf&amp;apos;s Room&quot;/&gt;";
+    std::vector<char> buf(enc.begin(), enc.end());
+    size_t len = decodeEntitiesInPlace(buf.data(), buf.size(), false);
+    Member m[4];
+    int n = parseMembers(buf.data(), len, m, 4);
+    TEST_ASSERT_EQUAL_INT(1, n);
+    TEST_ASSERT_EQUAL_STRING("RINCON_A1400", sv(m[0].uuid).c_str());
+    TEST_ASSERT_EQUAL_STRING("Caf&apos;s Room", sv(m[0].name).c_str());   // entity left for decodeHTML
+}
+
+void test_members_ignore_other_tags_and_respect_limit(void) {
+    const char* x = "<ZoneGroup Coordinator=\"a\"><ZoneGroupMemberXYZ UUID=\"x\"/>"
+                    "<ZoneGroupMember UUID=\"b\"/><ZoneGroupMember UUID=\"c\"/></ZoneGroup>";
+    Member m[1];
+    TEST_ASSERT_EQUAL_INT(1, parseMembers(x, strlen(x), m, 1));
+    TEST_ASSERT_EQUAL_STRING("b", sv(m[0].uuid).c_str());
+    TEST_ASSERT_EQUAL_INT(0, parseMembers(nullptr, 0, m, 1));
+    TEST_ASSERT_EQUAL_INT(0, parseMembers("<ZoneGroupMember UUID=\"unterminated", 35, m, 1));
+}
+
+// The background refresh parses members from the case-kept buffer, then
+// lowercases the SAME buffer and hands it to the group parser instead of making a
+// second GetZoneGroupState call. Both readings must agree.
+void test_one_payload_serves_members_and_groups(void) {
+    std::string enc(HIDDEN_FIXTURE);
+    std::vector<char> buf(enc.begin(), enc.end());
+    size_t len = decodeEntitiesInPlace(buf.data(), buf.size(), false);
+    Member m[16];
+    int n = parseMembers(buf.data(), len, m, 16);
+    TEST_ASSERT_EQUAL_INT(5, n);
+    std::string firstName = sv(m[0].name);               // copied out before lowercasing
+    for (size_t i = 0; i < len; i++) if (buf[i] >= 'A' && buf[i] <= 'Z') buf[i] += 32;
+    Group g[8];
+    Slice s[16];
+    int groups = parseZoneGroups(buf.data(), len, g, 8, s, 16);
+    TEST_ASSERT_EQUAL_INT(3, groups);
+    TEST_ASSERT_EQUAL_INT(1, g[0].memberCount);          // Beam; its Sub is a Satellite, not a member
+    TEST_ASSERT_EQUAL_INT(2, g[1].memberCount);          // stereo pair: two members, one visible room
+    TEST_ASSERT_EQUAL_STRING("Living Room", firstName.c_str());
+}
+
+void test_location_host_rejects_garbage(void) {
+    char host[24];
+    Slice a = {"nonsense", 8};
+    TEST_ASSERT_FALSE(locationHost(a, host, sizeof(host)));
+    Slice b = {nullptr, 0};
+    TEST_ASSERT_FALSE(locationHost(b, host, sizeof(host)));
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
 
@@ -302,6 +414,13 @@ int main(int, char**) {
     RUN_TEST(test_truncated_response_is_safe);
     RUN_TEST(test_empty_input_is_safe);
     RUN_TEST(test_respects_buffer_limits);
+    RUN_TEST(test_members_flag_satellites_and_invisible);
+    RUN_TEST(test_members_read_name_and_address);
+    RUN_TEST(test_members_work_on_lowercased_buffer);
+    RUN_TEST(test_members_decode_keeps_case);
+    RUN_TEST(test_members_ignore_other_tags_and_respect_limit);
+    RUN_TEST(test_one_payload_serves_members_and_groups);
+    RUN_TEST(test_location_host_rejects_garbage);
 
     return UNITY_END();
 }

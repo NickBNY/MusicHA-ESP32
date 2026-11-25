@@ -63,6 +63,15 @@ static lv_timer_t* sb_dock_timer = nullptr;
 // its OWN dock, so moving General -> Speakers -> Display used to show a blank
 // dock that only populated on the next 500ms tick. That read as the footer
 // reloading on every navigation.
+// lv_label_set_text() re-lays-out and invalidates its label even when the text is
+// identical, and the dock refreshes twice a second whether or not anything changed.
+// Comparing first turns a steady dock into zero redraws.
+static void setIfChanged(lv_obj_t* label, const char* text) {
+    const char* cur = lv_label_get_text(label);
+    if (cur && strcmp(cur, text) == 0) return;
+    lv_label_set_text(label, text);
+}
+
 static void sbDockWrite(SbDock& d) {
     if (!d.title) return;
 
@@ -90,18 +99,20 @@ static void sbDockWrite(SbDock& d) {
     const bool have = track.length() > 0;
 
     if (have) {
-        lv_label_set_text(d.title, track.c_str());
-        if (artist.length() && room.length())
-            lv_label_set_text_fmt(d.meta, "%s · %s", artist.c_str(), room.c_str());
-        else if (room.length())
-            lv_label_set_text(d.meta, room.c_str());
-        else
-            lv_label_set_text(d.meta, artist.c_str());
-        lv_label_set_text(d.play_icon, playing ? AMB_IC_PAUSE : AMB_IC_PLAY);
+        setIfChanged(d.title, track.c_str());
+        if (artist.length() && room.length()) {
+            String meta = artist + " · " + room;
+            setIfChanged(d.meta, meta.c_str());
+        } else if (room.length()) {
+            setIfChanged(d.meta, room.c_str());
+        } else {
+            setIfChanged(d.meta, artist.c_str());
+        }
+        setIfChanged(d.play_icon, playing ? AMB_IC_PAUSE : AMB_IC_PLAY);
     } else {
-        lv_label_set_text(d.title, "Not Playing");
-        lv_label_set_text(d.meta, room.length() ? room.c_str() : "No speaker selected");
-        lv_label_set_text(d.play_icon, AMB_IC_PLAY);
+        setIfChanged(d.title, "Not Playing");
+        setIfChanged(d.meta, room.length() ? room.c_str() : "No speaker selected");
+        setIfChanged(d.play_icon, AMB_IC_PLAY);
     }
 
     // ── Artwork ─────────────────────────────────────────────────────────────
@@ -363,7 +374,9 @@ lv_obj_t* createSettingsSidebar(lv_obj_t* screen, int activeIdx) {
             switch(idx) {
                 case 0: lv_screen_load(scr_general);        break;
                 case 1: lv_screen_load(scr_devices);        break;
-                case 2: lv_screen_load(scr_groups);         break;
+                // ev_groups() repaints from cache, loads, and refreshes the
+                // topology in a task. A plain load showed a stale list.
+                case 2: ev_groups(nullptr);                 break;
                 case 3: lv_screen_load(scr_sources);        break;
                 case 4: lv_screen_load(scr_display);        break;
                 case 5: lv_screen_load(scr_wifi);           break;

@@ -131,8 +131,14 @@ void updateLineInUI() {
 
     setLineInMode(true);
 
-    // Subtitle: use track title if Sonos provides a device name, otherwise "Analog Input"
-    String sourceName = dev->currentTrack.length() > 0 ? dev->currentTrack : "Analog Input";
+    // Subtitle: use track title if Sonos provides a device name, otherwise "Analog Input".
+    // currentTrack is a String the polling task reassigns under deviceMutex; copy it
+    // under the lock. On timeout keep the label as is and retry on the next tick.
+    String track;
+    if (xSemaphoreTake(sonos.getDeviceMutex(), pdMS_TO_TICKS(30)) != pdTRUE) return;
+    track = dev->currentTrack;
+    xSemaphoreGive(sonos.getDeviceMutex());
+    String sourceName = track.length() > 0 ? track : "Analog Input";
 
     static String last_source;
     if (sourceName != last_source) {
